@@ -127,7 +127,14 @@ def _extract_authority_row(parsed: Dict[str, Any], domain: str) -> Dict[str, Any
         row["linking_websites"] = r.get("linking_websites")
         row["backlinks_dofollow_percentage"] = r.get("backlinks_dofollow_percentage")
         row["linking_websites_dofollow_percentage"] = r.get("linking_websites_dofollow_percentage")
-        row["status"] = "completed"
+        # Only a real DR (or backlinks) means the modal actually rendered
+        # metrics. Missing values => the check failed (modal never appeared,
+        # "something went wrong", turnstile timeout, etc.) — mark it failed
+        # instead of silently recording a null "completed".
+        if r.get("dr") is not None or r.get("backlinks") is not None:
+            row["status"] = "completed"
+        elif r.get("error"):
+            row["error"] = r.get("error")
     return row
 
 
