@@ -766,7 +766,7 @@ def scrape_domain(driver, domain: str, mode: CheckerMode) -> Dict[str, Any]:
         """
         driver.execute_script(kickoff_js)
 
-        poll_deadline = time.time() + (120 if mode.name == "traffic" else 60)
+        poll_deadline = time.time() + 45
         last_click = 0.0
 
         while time.time() < poll_deadline:
