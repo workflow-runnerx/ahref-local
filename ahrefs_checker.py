@@ -114,6 +114,13 @@ class CheckerMode:
         self.spec_path = spec_path
         self.extract_row = extract_row
 
+    def build_url(self, domain: str) -> str:
+        """Build the per-domain target URL. The domain is passed via the
+        ``?input=`` query param so Ahrefs auto-runs the check (no typing)."""
+        from urllib.parse import quote
+
+        return self.target_url.format(domain=quote(domain, safe=""))
+
 
 def _extract_authority_row(parsed: Dict[str, Any], domain: str) -> Dict[str, Any]:
     """Authority-mode result extractor: DR / backlinks / linking websites."""
@@ -163,14 +170,14 @@ MODES: Dict[str, CheckerMode] = {
     "authority": CheckerMode(
         name="authority",
         endpoint="/ahref-authority/",
-        target_url="https://ahrefs.com/website-authority-checker/",
+        target_url="https://ahrefs.com/website-authority-checker/?input={domain}",
         spec_path=AHREFS_JSON_PATH,
         extract_row=_extract_authority_row,
     ),
     "traffic": CheckerMode(
         name="traffic",
         endpoint="/ahref-traffic/",
-        target_url="https://ahrefs.com/traffic-checker/?mode=subdomains",
+        target_url="https://ahrefs.com/traffic-checker/?input={domain}&mode=subdomains",
         spec_path=AHREFS_TRAFFIC_JSON_PATH,
         extract_row=_extract_traffic_row,
     ),
@@ -728,18 +735,14 @@ def scrape_domain(driver, domain: str, mode: CheckerMode) -> Dict[str, Any]:
 
     try:
         try:
-            driver.get(mode.target_url)
+            driver.get(mode.build_url(domain))
         except Exception:
             pass
 
+        # Domain is supplied via the URL (?input=<domain>), so Ahrefs auto-runs
+        # the check — no input typing/submit. Let the page settle, then inject
+        # the extract-only JS which waits for the result modal directly.
         time.sleep(2)
-
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            has_input = driver.execute_script("return !!document.querySelector(\"input[type='text']\")")
-            if has_input:
-                break
-            time.sleep(0.3)
 
         js_template = load_mode_js(mode.spec_path)
         js_payload = js_template.replace("${domains}", domain)
