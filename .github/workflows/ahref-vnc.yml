@@ -12,6 +12,10 @@ on:
           - authority,traffic
           - authority
           - traffic
+      workers:
+        description: 'Number of parallel checker workers'
+        required: false
+        default: '1'
 
 env:
   DISPLAY: ":1"
@@ -20,6 +24,9 @@ env:
   VNC_PASSWORD: "botxbyte123"
   AHREF_DIR: "/home/runner/ahref-local"
   AHREF_MODES: ${{ github.event.inputs.modes || 'authority,traffic' }}
+  # Worker size, set per run by the Workflow Runner page. Default 1: the
+  # cf-autoclick extension drives one browser window at a time.
+  AHREF_WORKERS: ${{ github.event.inputs.workers || '1' }}
 
 jobs:
   run:
@@ -204,14 +211,14 @@ jobs:
 
       - name: Start Ahref Checker
         run: |
-          echo "Starting ahrefs_checker.py (modes=${AHREF_MODES}, 1 worker, webshare proxy)..."
+          echo "Starting ahrefs_checker.py (modes=${AHREF_MODES}, ${AHREF_WORKERS} worker(s), webshare proxy)..."
           export DISPLAY=:1
           export NO_AT_BRIDGE=1
           cd "$AHREF_DIR"
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --no-cache-dir -r requirements.txt
-          nohup python3 ahrefs_checker.py --workers 1 --webshare-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
+          nohup python3 ahrefs_checker.py --workers "${AHREF_WORKERS}" --webshare-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
           CHECKER_PID=$!
           echo "  Checker PID: $CHECKER_PID (modes: ${AHREF_MODES})"
           sleep 5
@@ -232,7 +239,7 @@ jobs:
           echo "🌐 VNC Access URL: ${{ steps.tunnel.outputs.tunnel_url }}/vnc.html"
           echo "🔑 Password: botxbyte123"
           echo ""
-          echo "🐍 ahrefs_checker.py running with: --workers 1 --webshare-proxy --modes ${AHREF_MODES}"
+          echo "🐍 ahrefs_checker.py running with: --workers ${AHREF_WORKERS} --webshare-proxy --modes ${AHREF_MODES}"
           echo "    (auto-routes between authority and traffic queues — whichever has work)"
           echo ""
 
@@ -269,7 +276,7 @@ jobs:
               export NO_AT_BRIDGE=1
               cd "$AHREF_DIR"
               source .venv/bin/activate
-              nohup python3 ahrefs_checker.py --workers 1 --webshare-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
+              nohup python3 ahrefs_checker.py --workers "${AHREF_WORKERS}" --webshare-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
               sleep 3
             fi
 
