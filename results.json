@@ -1,24 +1,133 @@
 [
   {
-    "domain": "botxbyte.com",
+    "domain_name": "botxbyte.com",
     "status": "completed",
     "dr": "0.2",
-    "backlinks": "1.2K",
-    "linking_websites": "176",
-    "backlinks_dofollow_pct": "40",
-    "linking_websites_dofollow_pct": "21",
-    "elapsed_seconds": 15.11,
-    "finished_at": "2026-06-01T09:46:10.717872+00:00"
+    "backlinks": "1.7K",
+    "linking_websites": "1.2K",
+    "backlinks_dofollow_percentage": "47",
+    "linking_websites_dofollow_percentage": "29",
+    "elapsed_seconds": 20.92,
+    "finished_at": "2026-10-09T20:24:07.194782+00:00",
+    "mode": "authority"
   },
   {
-    "domain": "github.com",
+    "domain_name": "github.com",
     "status": "completed",
     "dr": "97",
-    "backlinks": "3.7B",
-    "linking_websites": "2.3M",
-    "backlinks_dofollow_pct": "85",
-    "linking_websites_dofollow_pct": "94",
-    "elapsed_seconds": 17.89,
-    "finished_at": "2026-06-01T09:46:28.609442+00:00"
+    "backlinks": "3.1B",
+    "linking_websites": "1.8M",
+    "backlinks_dofollow_percentage": "91",
+    "linking_websites_dofollow_percentage": "95",
+    "elapsed_seconds": 13.17,
+    "finished_at": "2026-10-09T20:24:20.368880+00:00",
+    "mode": "authority"
+  },
+  {
+    "domain_name": "botxbyte.com",
+    "status": "completed",
+    "organic_traffic": "0",
+    "traffic_value": "$0",
+    "traffic_graph": {},
+    "top_countries": [],
+    "top_keywords": [],
+    "top_pages": [],
+    "turnstile_retries": 1,
+    "elapsed_seconds": 10.01,
+    "finished_at": "2026-10-09T20:24:30.376243+00:00",
+    "mode": "traffic"
+  },
+  {
+    "domain_name": "github.com",
+    "status": "completed",
+    "organic_traffic": "43.3M",
+    "traffic_value": "$24.8M",
+    "traffic_graph": {
+      "Jun": 43845806,
+      "Jul": 45479032,
+      "Aug": 45248710,
+      "Sep": 46251935,
+      "Oct": 42512581
+    },
+    "top_countries": [
+      {
+        "country": "United States",
+        "traffic_share": "23%"
+      },
+      {
+        "country": "India",
+        "traffic_share": "16%"
+      },
+      {
+        "country": "Russian Federation",
+        "traffic_share": "7%"
+      },
+      {
+        "country": "Indonesia",
+        "traffic_share": "5%"
+      },
+      {
+        "country": "Brazil",
+        "traffic_share": "5%"
+      }
+    ],
+    "top_keywords": [
+      {
+        "keyword": "github",
+        "position": "1",
+        "volume": "1.4M"
+      },
+      {
+        "keyword": "forge",
+        "position": "2",
+        "volume": "142K"
+      },
+      {
+        "keyword": "github desktop",
+        "position": "1",
+        "volume": "83K"
+      },
+      {
+        "keyword": "github pages",
+        "position": "1",
+        "volume": "58K"
+      },
+      {
+        "keyword": "github login",
+        "position": "1",
+        "volume": "57K"
+      }
+    ],
+    "top_pages": [
+      {
+        "url": "https://github.com/",
+        "traffic": "1.3M",
+        "traffic_percentage": "13%"
+      },
+      {
+        "url": "https://github.com/minecraftforge",
+        "traffic": "133.4K",
+        "traffic_percentage": "1%"
+      },
+      {
+        "url": "https://desktop.github.com/download/",
+        "traffic": "98.9K",
+        "traffic_percentage": "1%"
+      },
+      {
+        "url": "https://github.com/login",
+        "traffic": "90.5K",
+        "traffic_percentage": "1%"
+      },
+      {
+        "url": "https://pages.github.com/",
+        "traffic": "61.6K",
+        "traffic_percentage": "1%"
+      }
+    ],
+    "turnstile_retries": 1,
+    "elapsed_seconds": 10.0,
+    "finished_at": "2026-10-09T20:24:40.372257+00:00",
+    "mode": "traffic"
   }
 ]

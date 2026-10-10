@@ -20,6 +20,10 @@
 #   1. Update CHROMIUM_VERSION below
 #   2. Delete vendor/ungoogled-chromium/ and vendor/ungoogled-chromium.tar.xz
 #   3. Re-run this script
+#
+# Linux builds are fetched per architecture (x86_64 / arm64) and cached as
+# vendor/ungoogled-chromium-<arch>.tar.xz; the unpacked dir ships chromedriver
+# too, which ahrefs_checker.py uses on Linux (Google publishes no arm64 one).
 
 set -euo pipefail
 
@@ -30,20 +34,57 @@ VENDOR_DIR="${AHREF_DIR}/vendor"
 # ─── Pinned versions ────────────────────────────────────────────────────────
 # Bump this and re-run to upgrade. The portable Linux build is preferred
 # over the AppImage because it doesn't need FUSE and unpacks to plain files.
-CHROMIUM_VERSION="149.0.7827.53-1"
-CHROMIUM_TARBALL_URL="https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/${CHROMIUM_VERSION}/ungoogled-chromium-${CHROMIUM_VERSION}-x86_64_linux.tar.xz"
-CHROMIUM_TARBALL="${VENDOR_DIR}/ungoogled-chromium.tar.xz"
+# arm64 portable builds exist from 154.0.8037.57-1 on (153 and older are
+# x86_64 only); the Docker image is linux/arm64 so it runs natively on
+# Apple Silicon instead of under Rosetta (see DOCUMENTATION.md, Docker).
+CHROMIUM_VERSION="155.0.8059.39-1"
+case "$(uname -m)" in
+  aarch64|arm64) CHROMIUM_ARCH="arm64" ;;
+  x86_64|amd64)  CHROMIUM_ARCH="x86_64" ;;
+  *) echo "❌ unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+CHROMIUM_TARBALL_URL="https://github.com/ungoogled-software/ungoogled-chromium-portablelinux/releases/download/${CHROMIUM_VERSION}/ungoogled-chromium-${CHROMIUM_VERSION}-${CHROMIUM_ARCH}_linux.tar.xz"
+# Cached per architecture so an x86_64 tarball is never unpacked on arm64.
+CHROMIUM_TARBALL="${VENDOR_DIR}/ungoogled-chromium-${CHROMIUM_ARCH}.tar.xz"
 CHROMIUM_DIR="${VENDOR_DIR}/ungoogled-chromium"
-CHROMIUM_INNER="${VENDOR_DIR}/ungoogled-chromium-${CHROMIUM_VERSION}-x86_64_linux"
+CHROMIUM_INNER="${VENDOR_DIR}/ungoogled-chromium-${CHROMIUM_VERSION}-${CHROMIUM_ARCH}_linux"
 
 EXTENSION_URL="https://github.com/tenacious6/cf-autoclick.git"
 EXTENSION_DIR="${VENDOR_DIR}/cf-autoclick"
 
 mkdir -p "${VENDOR_DIR}"
 
-# ─── 1. ungoogled-chromium binary ───────────────────────────────────────────
-if [[ -x "${CHROMIUM_DIR}/chrome" ]]; then
+# ─── macOS: use the Homebrew cask instead of the Linux tarball ─────────────
+# The portable tarball above is a Linux x86_64 ELF build and cannot run on
+# macOS. On a Mac we install ungoogled-chromium via Homebrew (arm64/x86_64
+# native .app) and ahrefs_checker.py's find_chrome_binary() picks it up from
+# /Applications/Chromium.app. The cf-autoclick clone below is shared.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if [[ -x "/Applications/Chromium.app/Contents/MacOS/Chromium" ]]; then
+    echo "[*] Chromium.app already present in /Applications — skipping"
+  else
+    if ! command -v brew >/dev/null 2>&1; then
+      echo "❌ Homebrew not found. Install it from https://brew.sh then re-run." >&2
+      exit 1
+    fi
+    echo "[*] Installing ungoogled-chromium via Homebrew cask..."
+    brew install --cask ungoogled-chromium
+  fi
+  echo "[*] Verifying binary..."
+  "/Applications/Chromium.app/Contents/MacOS/Chromium" --version
+  echo "✅ Chromium ready at /Applications/Chromium.app"
+  CHROMIUM_DIR="/Applications/Chromium.app"
+fi
+
+# ─── 1. ungoogled-chromium binary (Linux) ───────────────────────────────────
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  : # handled above
+elif [[ -x "${CHROMIUM_DIR}/chrome" ]] && "${CHROMIUM_DIR}/chrome" --version >/dev/null 2>&1; then
   echo "[*] ungoogled-chromium already present at ${CHROMIUM_DIR}/chrome — skipping"
+elif [[ -d "${CHROMIUM_DIR}" ]]; then
+  echo "❌ ${CHROMIUM_DIR} exists but does not run on this machine ($(uname -m))." >&2
+  echo "   It was probably unpacked for another architecture — delete it and re-run." >&2
+  exit 1
 else
   if [[ ! -f "${CHROMIUM_TARBALL}" ]]; then
     echo "[*] Downloading ungoogled-chromium ${CHROMIUM_VERSION}..."
@@ -98,7 +139,7 @@ cat <<EOF
 ║                  ✅  VENDOR SETUP COMPLETE                   ║
 ╚══════════════════════════════════════════════════════════════╝
 
-  Chromium:  ${CHROMIUM_DIR}/chrome
+  Chromium:  ${CHROMIUM_DIR}
   Extension: ${EXTENSION_DIR}
 
 ahrefs_checker.py will auto-discover both at runtime. Try:

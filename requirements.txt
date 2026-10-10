@@ -4,3 +4,6 @@ requests>=2.31.0
 # Python 3.12+ removed distutils from stdlib; setuptools<81 still vendors it
 # (undetected-chromedriver imports distutils internally)
 setuptools<81
+# TLS/h2 fingerprint proxy (fingerprint_proxy.py): Chrome-impersonating upstream + local CA
+curl_cffi>=0.10.0
+cryptography>=42.0.0

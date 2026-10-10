@@ -1,0 +1,49 @@
+# docker compose -f docker/docker-compose.yml build
+# docker compose -f docker/docker-compose.yml run --rm checker --domains-file domains/sample-200.txt --modes authority
+# docker compose -f docker/docker-compose.yml run --rm probe
+#
+# Put the Bright Data proxy in docker/.env (gitignored):
+#   BRIGHTDATA_PROXY=brd.superproxy.io:44445:brd-customer-<id>-zone-<zone>:<password>
+# Results, logs, probe output and burned_ips.txt land in ./out/ on the host.
+
+x-common: &common
+  image: ahref-local:latest
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  platform: linux/arm64
+  shm_size: "1g"
+  init: true
+  environment:
+    TZ: ${TZ:-America/New_York}
+    SCREEN: ${SCREEN:-1920x1080x24}
+    AHREF_PROXY: ${BRIGHTDATA_PROXY:-}
+    AHREF_BURNED_IPS: /app/out/burned_ips.txt
+    AHREF_FP_DEBUG: ${AHREF_FP_DEBUG:-0}
+    AHREF_FP_DIRECT: ${AHREF_FP_DIRECT:-0}
+    AHREF_FP_IMPERSONATE: ${AHREF_FP_IMPERSONATE:-chrome}
+    # screenshots + widget HTML when Turnstile escalates to the checkbox
+    AHREF_EVIDENCE_DIR: ${AHREF_EVIDENCE_DIR:-/app/out}
+  volumes:
+    - ../out:/app/out
+    - ../domains:/app/domains:ro
+    - fp-ca:/home/ahref/.ahref-fp-proxy
+
+services:
+  checker:
+    <<: *common
+    command: ["--domains-file", "domains/sample-200.txt", "--out", "out/results.json", "--modes", "authority"]
+
+  probe:
+    <<: *common
+    environment:
+      TZ: ${TZ:-America/New_York}
+      SCREEN: ${SCREEN:-1920x1080x24}
+      AHREF_PROXY: ${BRIGHTDATA_PROXY:-}
+      AHREF_FP_DEBUG: ${AHREF_FP_DEBUG:-0}
+      AHREF_FP_DIRECT: ${AHREF_FP_DIRECT:-0}
+      PROBE: "1"
+    command: ["--out", "out/probe-docker.json", "--screenshot-dir", "out"]
+
+volumes:
+  fp-ca:

@@ -23,6 +23,13 @@ killed.
 Usage:
     python ahrefs_checker.py [--modes MODES] [--api-url URL] [--headless] [--workers 5]
                              [--chrome /path/to/chrome] [--extension /path/to/ext/folder]
+                             [--proxy host:port[:user:pass]]
+
+    Batch mode (no queue server — fixed list in, JSON out):
+    python ahrefs_checker.py --domains-file domains.txt --out results.json \
+                             --proxy brd.superproxy.io:44445:USER:PASS --modes authority
+    Authority batches solve ONE Turnstile captcha in the browser and reuse its
+    token over Ahrefs' own API for the rest of the list (see "Batch mode").
 
     MODES is a comma-separated list (default: 'authority,traffic'). Set to
     a single value (e.g. 'traffic') to lock the worker to one queue.
@@ -47,8 +54,7 @@ import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -402,14 +408,31 @@ def _create_plain_profile(worker_id: int) -> str:
 
 
 def _remove_worker_profile(path: Optional[str]) -> None:
-    """Remove a single per-worker profile dir and stop tracking it."""
+    """Remove a single per-worker profile dir and stop tracking it.
+
+    Chromium keeps flushing its disk cache for a moment after driver.quit()
+    returns, so a single rmtree races with the browser and leaves a stub
+    (Default/Cache/...) behind. Retry a few times until the dir is gone."""
     if not path:
         return
-    try:
-        if os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
+    # Chromium is still shutting down when driver.quit() returns and re-creates
+    # Default/Cache + "Network Persistent State" a second or two later, so a
+    # single rmtree leaves a stub behind. Keep removing until the directory
+    # has stayed absent for a few consecutive polls (or ~12 s have passed).
+    deadline = time.time() + 12
+    absent_polls = 0
+    while time.time() < deadline:
+        try:
+            if os.path.isdir(path):
+                absent_polls = 0
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                absent_polls += 1
+                if absent_polls >= 4:
+                    break
+        except Exception:
+            pass
+        time.sleep(0.5)
     with _PROFILES_LOCK:
         try:
             _CREATED_PROFILES.remove(path)
@@ -460,6 +483,193 @@ def _install_signal_handlers() -> None:
             signal.signal(sig, _handler)
         except (ValueError, OSError):
             pass
+
+
+# ----------------------------------------------------------------------------
+# Proxy handling
+#
+# Proxy specs are "host:port" (IP-authorised) or "host:port:user:pass".
+# Chromium never talks to the upstream proxy itself: every browser gets a
+# local fingerprint proxy (fingerprint_proxy.py) on 127.0.0.1:<port> that
+# terminates TLS with a locally-signed leaf cert and re-issues each request
+# through curl_cffi impersonating Chrome, optionally via the upstream proxy.
+# Cloudflare therefore scores curl_cffi's Chrome TLS ClientHello / h2
+# fingerprint instead of the vendored ungoogled-chromium's, while cookies,
+# User-Agent and all other headers come from the real browser untouched.
+# (The previous CONNECT auth forwarder only injected Proxy-Authorization and
+# let the browser's own TLS pass through.)
+#
+# Bright Data: the ISP zone hands out a different exit IP on every connection
+# unless the username carries a "-session-<id>" suffix. Cloudflare binds its
+# cookies/Turnstile token to the exit IP, so every worker gets its own sticky
+# session id (see make_sticky_proxy).
+# ----------------------------------------------------------------------------
+
+_FORWARDERS: Dict[str, Any] = {}          # upstream key -> FingerprintProxy
+_FORWARDERS_LOCK = threading.Lock()
+
+# Set AHREF_FP_DIRECT=1 to route the browser through the fingerprint proxy
+# even with --no-proxy (no upstream; useful to verify the fingerprint locally).
+FP_DIRECT = os.environ.get("AHREF_FP_DIRECT", "") not in ("", "0", "false")
+
+
+def parse_proxy(spec: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Parse 'host:port' / 'host:port:user:pass' (also accepts scheme://user:pass@host:port)."""
+    if not spec:
+        return None
+    spec = spec.strip()
+    if "://" in spec:
+        from urllib.parse import urlparse, unquote
+        u = urlparse(spec)
+        return {"host": u.hostname, "port": int(u.port or 80),
+                "user": unquote(u.username) if u.username else None,
+                "passwd": unquote(u.password) if u.password else None}
+    parts = spec.split(":")
+    if len(parts) == 2:
+        return {"host": parts[0], "port": int(parts[1]), "user": None, "passwd": None}
+    if len(parts) >= 4:
+        # password may itself contain ':' — re-join the tail
+        return {"host": parts[0], "port": int(parts[1]), "user": parts[2],
+                "passwd": ":".join(parts[3:])}
+    raise ValueError(f"Bad proxy spec {spec!r}; expected host:port or host:port:user:pass")
+
+
+def format_proxy(p: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not p:
+        return None
+    if p.get("user"):
+        return f"{p['host']}:{p['port']}:{p['user']}:{p['passwd']}"
+    return f"{p['host']}:{p['port']}"
+
+
+def make_sticky_proxy(spec: Optional[str], session_id: Optional[str] = None) -> Optional[str]:
+    """Give Bright Data (brd.superproxy.io) proxies a sticky session so all
+    connections of one worker share one exit IP. Other providers pass through."""
+    p = parse_proxy(spec)
+    if not p or not p.get("user"):
+        return spec
+    host = (p.get("host") or "").lower()
+    if "superproxy.io" not in host and "brd-customer" not in p["user"]:
+        return spec
+    if "-session-" in p["user"]:
+        return spec
+    sid = session_id or uuid.uuid4().hex[:10]
+    p["user"] = f"{p['user']}-session-{sid}"
+    return format_proxy(p)
+
+
+def proxy_for_requests(spec: Optional[str]) -> Optional[Dict[str, str]]:
+    """requests-style proxies dict for the same proxy the browser uses."""
+    p = parse_proxy(spec)
+    if not p:
+        return None
+    from urllib.parse import quote
+    if p.get("user"):
+        url = f"http://{quote(p['user'], safe='')}:{quote(p['passwd'] or '', safe='')}@{p['host']}:{p['port']}"
+    else:
+        url = f"http://{p['host']}:{p['port']}"
+    return {"http": url, "https": url}
+
+
+def _start_fingerprint_proxy(host: Optional[str], port: Optional[int],
+                             user: Optional[str], passwd: Optional[str]) -> int:
+    """Start (once per upstream) the local TLS/h2 fingerprint proxy and
+    return its port. host=None means no upstream (direct)."""
+    from fingerprint_proxy import FingerprintProxy, upstream_url
+
+    upstream = upstream_url(host, port, user, passwd) if host else None
+    key = upstream or "direct"
+    with _FORWARDERS_LOCK:
+        fp = _FORWARDERS.get(key)
+        if fp is not None:
+            return fp.port
+        fp = FingerprintProxy(upstream=upstream)
+        lport = fp.start()
+        _FORWARDERS[key] = fp
+        who = f"{host}:{port} (user {user[:24]}{'…' if user and len(user) > 24 else ''})" if host else "direct"
+        print(f"  [proxy] fingerprint proxy 127.0.0.1:{lport} -> {who} "
+              f"[curl_cffi impersonate={fp.impersonate}]", flush=True)
+        return lport
+
+
+def _stop_fingerprint_proxies() -> None:
+    with _FORWARDERS_LOCK:
+        fps = list(_FORWARDERS.values())
+        _FORWARDERS.clear()
+    for fp in fps:
+        try:
+            fp.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_stop_fingerprint_proxies)
+
+
+BURNED_IPS_PATH = os.environ.get(
+    "AHREF_BURNED_IPS",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "burned_ips.txt"),
+)
+_BURNED_LOCK = threading.Lock()
+
+
+def load_burned_ips(path: str = BURNED_IPS_PATH) -> Dict[str, str]:
+    """burned_ips.txt: one line per IP — 'ip<TAB>when<TAB>reason'. Returns {ip: when}."""
+    out: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                out[parts[0].strip()] = parts[1] if len(parts) > 1 else ""
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        tprint(f"  [burned] cannot read {path}: {e}")
+    return out
+
+
+def mark_ip_burned(ip: Optional[str], reason: str, path: str = BURNED_IPS_PATH) -> None:
+    if not ip:
+        return
+    with _BURNED_LOCK:
+        if ip in load_burned_ips(path):
+            return
+        try:
+            new_file = not os.path.exists(path)
+            with open(path, "a", encoding="utf-8") as fh:
+                if new_file:
+                    fh.write("# exit IPs that Ahrefs/Cloudflare rejected — never reused. ip<TAB>when(UTC)<TAB>reason\n")
+                fh.write(f"{ip}\t{datetime.now(timezone.utc).isoformat(timespec='seconds')}\t{reason}\n")
+            tprint(f"  [burned] {ip} added to {os.path.basename(path)} ({reason})")
+        except Exception as e:
+            tprint(f"  [burned] cannot write {path}: {e}")
+
+
+def exit_ip_via_requests(spec: Optional[str], timeout: float = 15.0) -> Optional[str]:
+    """Resolve the exit IP of a proxy spec with a plain HTTP request (no browser)."""
+    try:
+        r = requests.get("https://api.ipify.org", proxies=proxy_for_requests(spec), timeout=timeout)
+        ip = r.text.strip()
+        return ip if r.status_code == 200 and len(ip) <= 45 else None
+    except Exception as e:
+        tprint(f"  [proxy] exit IP lookup failed: {str(e)[:100]}")
+        return None
+
+
+def chrome_proxy_arg(spec: Optional[str]) -> Optional[str]:
+    """Translate a proxy spec into a --proxy-server value Chromium can use.
+    Always the local fingerprint proxy — IP-authorised proxies too, otherwise
+    the browser's own TLS fingerprint would reach Cloudflare."""
+    p = parse_proxy(spec)
+    if not p:
+        if FP_DIRECT:
+            return f"http://127.0.0.1:{_start_fingerprint_proxy(None, None, None, None)}"
+        return None
+    lport = _start_fingerprint_proxy(p["host"], p["port"], p.get("user"), p.get("passwd") or "")
+    return f"http://127.0.0.1:{lport}"
 
 
 # ----------------------------------------------------------------------------
@@ -536,7 +746,19 @@ def find_chrome_binary() -> Optional[str]:
             "/usr/bin/google-chrome",
         ]
     elif system == "Darwin":
-        candidates = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+        # Prefer ungoogled-chromium (supports --load-extension, which branded
+        # Google Chrome 137+ dropped). Order: vendored .app in vendor/, then the
+        # `brew install --cask ungoogled-chromium` install, then plain Chromium,
+        # and only then Google Chrome as a last resort.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(script_dir, "vendor", "ungoogled-chromium", "Chromium.app",
+                         "Contents", "MacOS", "Chromium"),
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            os.path.join(home, "Applications", "Chromium.app", "Contents", "MacOS", "Chromium"),
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
     elif system == "Windows":
         for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
             base = os.environ.get(env, "")
@@ -545,6 +767,19 @@ def find_chrome_binary() -> Optional[str]:
     for c in candidates:
         if c and os.path.exists(c):
             return c
+    return None
+
+
+def find_chromedriver_binary(chrome_binary: Optional[str]) -> Optional[str]:
+    """chromedriver shipped next to the vendored Linux chrome binary, or
+    AHREF_CHROMEDRIVER; None lets undetected-chromedriver download one."""
+    env = os.environ.get("AHREF_CHROMEDRIVER")
+    if env and os.path.isfile(env):
+        return env
+    if chrome_binary and platform.system() == "Linux":
+        cand = os.path.join(os.path.dirname(os.path.abspath(chrome_binary)), "chromedriver")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
     return None
 
 
@@ -571,7 +806,7 @@ def _free_port() -> int:
 
 def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
                  version_main: Optional[int], proxy: Optional[str] = None,
-                 extension_path: Optional[str] = None):
+                 extension_path: Optional[str] = None, perf_log: bool = False):
     """Build a uc.Chrome driver.
 
     If extension_path is provided (via --extension CLI arg), load the
@@ -589,7 +824,7 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
             return _build_driver_locked(
                 worker_id, headless=headless, chrome_binary=chrome_binary,
                 version_main=version_main, proxy=proxy, uc=uc,
-                extension_path=extension_path,
+                extension_path=extension_path, perf_log=perf_log,
             )
         finally:
             _release_driver_build_lock(file_lock)
@@ -597,8 +832,12 @@ def build_driver(worker_id: int, headless: bool, chrome_binary: Optional[str],
 
 def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional[str],
                          version_main: Optional[int], proxy: Optional[str],
-                         uc, extension_path: Optional[str] = None):
+                         uc, extension_path: Optional[str] = None,
+                         perf_log: bool = False):
     opts = uc.ChromeOptions()
+    if perf_log:
+        # Batch mode reads the Turnstile token out of the network log.
+        opts.set_capability("goog:loggingPrefs", {"performance": "ALL", "browser": "ALL"})
     opts.page_load_strategy = "eager"
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
@@ -613,6 +852,10 @@ def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional
     # plaintext "basic" backend is fine.
     opts.add_argument("--password-store=basic")
     opts.add_argument("--use-mock-keychain")
+    # Extra Chromium switches, space separated (e.g. software WebGL inside a
+    # GPU-less container — see docker/Dockerfile for the default used there).
+    for extra in (os.environ.get("AHREF_CHROME_ARGS") or "").split():
+        opts.add_argument(extra)
 
     # ── Extension + Profile loading ───────────────────────────────────────
     if extension_path and os.path.isdir(extension_path):
@@ -643,40 +886,35 @@ def _build_driver_locked(worker_id: int, headless: bool, chrome_binary: Optional
     if chrome_binary:
         opts.binary_location = chrome_binary
 
-    # Proxy auth extension if needed
-    if proxy:
-        parts = proxy.split(":")
-        if len(parts) == 4:
-            ip, port, user, passwd = parts
-            ext_zip = os.path.join(tempfile.gettempdir(), f"proxy_ext_w{worker_id}.zip")
-            with zipfile.ZipFile(ext_zip, 'w') as zp:
-                zp.writestr("manifest.json", json.dumps({
-                    "version": "1.0.0", "manifest_version": 2, "name": "Proxy Auth",
-                    "permissions": ["proxy", "tabs", "unlimitedStorage", "storage",
-                                    "<all_urls>", "webRequest", "webRequestBlocking"],
-                    "background": {"scripts": ["background.js"]},
-                    "minimum_chrome_version": "22.0.0"
-                }))
-                zp.writestr("background.js", f"""
-                    var config = {{mode: "fixed_servers", rules: {{
-                        singleProxy: {{scheme: "http", host: "{ip}", port: parseInt({port})}},
-                        bypassList: ["localhost"]
-                    }}}};
-                    chrome.proxy.settings.set({{value: config, scope: "regular"}}, function(){{}});
-                    chrome.webRequest.onAuthRequired.addListener(
-                        function(details) {{ return {{authCredentials: {{username: "{user}", password: "{passwd}"}}}}; }},
-                        {{urls: ["<all_urls>"]}}, ['blocking']
-                    );
-                """)
-            opts.add_extension(ext_zip)
-        elif len(parts) == 2:
-            # IP-authorized proxy (no user/pass) — use Chrome's --proxy-server
-            opts.add_argument(f"--proxy-server=http://{proxy}")
+    # Proxy: host:port goes straight to --proxy-server; host:port:user:pass is
+    # routed through the in-process auth forwarder (MV2 auth extensions no
+    # longer load in current Chromium builds — see chrome_proxy_arg()).
+    proxy_arg = chrome_proxy_arg(proxy) if (proxy or FP_DIRECT) else None
+    if proxy_arg:
+        opts.add_argument(f"--proxy-server={proxy_arg}")
+        # The fingerprint proxy terminates TLS with leaf certs from its own
+        # local CA (~/.ahref-fp-proxy/ca.pem). Unless the CA has been trusted
+        # in the browser's store (AHREF_FP_CA_TRUSTED=1, e.g. certutil into
+        # ~/.pki/nssdb on Linux — see docker/entrypoint.sh), accept them.
+        ca_trusted = os.environ.get("AHREF_FP_CA_TRUSTED", "") not in ("", "0", "false")
+        if not ca_trusted:
+            opts.add_argument("--ignore-certificate-errors")
+        print(f"  [worker-{worker_id}] --proxy-server={proxy_arg} (fingerprint proxy, "
+              f"{'CA trusted' if ca_trusted else '--ignore-certificate-errors'})", flush=True)
 
     _ensure_uc_binary_present()
 
+    # Linux: the vendored ungoogled-chromium tarball ships a matching
+    # chromedriver; use it instead of undetected-chromedriver's download
+    # (Google publishes no linux-arm64 chromedriver at all). uc patches the
+    # given binary in place on first use.
+    driver_path = find_chromedriver_binary(chrome_binary)
+    if driver_path:
+        print(f"  [worker-{worker_id}] chromedriver: {driver_path} (vendored)", flush=True)
+
     driver = uc.Chrome(options=opts, headless=headless, use_subprocess=True,
-                       version_main=version_main, user_data_dir=profile)
+                       version_main=version_main, user_data_dir=profile,
+                       driver_executable_path=driver_path)
     driver.set_page_load_timeout(15)
     driver.set_script_timeout(45)
 
@@ -703,7 +941,7 @@ def _ensure_uc_binary_present() -> None:
         try:
             shutil.copy2(_UC_BIN_BACKUP, canonical)
             os.chmod(canonical, 0o755)
-            print(f"  [uc-cache] restored chromedriver from backup", flush=True)
+            print("  [uc-cache] restored chromedriver from backup", flush=True)
         except Exception as e:
             print(f"  [uc-cache] restore failed: {e}", flush=True)
 
@@ -724,12 +962,101 @@ def _snapshot_uc_binary() -> None:
         pass
 
 
+# ── Turnstile interactive checkbox ───────────────────────────────────────────
+# When Cloudflare escalates from the invisible check to "Verify you are
+# human", the widget is a ~300×65 <iframe> whose src is EMPTY (the challenge
+# frame is navigated programmatically). Matching on src therefore finds
+# nothing — that is why the old ActionChains fallback (and cf-autoclick's own
+# lookup) never clicked it. Find it by its box instead and click through CDP.
+TURNSTILE_MAX_CLICKS = int(os.environ.get("AHREF_TURNSTILE_CLICKS", "2"))  # 0 = never click (measure the invisible pass)
+TURNSTILE_CLICK_GAP_S = 8.0       # a rejected click shows "Troubleshoot"; more clicks never help
+TURNSTILE_CLICK_GRACE_S = 6.0     # managed mode shows "Verifying…" first; give it a chance before clicking
+
+_TURNSTILE_WIDGET_JS = """
+return (function(){
+  var out=[], ifr=document.querySelectorAll('iframe');
+  for (var i=0;i<ifr.length;i++){
+    var f=ifr[i], r=f.getBoundingClientRect(), src=f.src||'', title=f.title||'';
+    var bySrc=src.indexOf('challenges.cloudflare.com')!==-1, byTitle=/cloudflare/i.test(title);
+    var byBox=r.width>=240&&r.width<=360&&r.height>=50&&r.height<=90;
+    if (bySrc||byTitle||byBox) out.push({x:r.left,y:r.top,w:r.width,h:r.height,
+        how:bySrc?'src':(byTitle?'title':'box'), html:(f.outerHTML||'').slice(0,600)});
+  }
+  return out;
+})();
+"""
+
+
+def _find_turnstile_widget(driver) -> Optional[Dict[str, Any]]:
+    """Viewport box of the Turnstile widget iframe, or None. Light DOM first,
+    then a CDP pierce through shadow roots (some widget variants live there)."""
+    try:
+        found = driver.execute_script(_TURNSTILE_WIDGET_JS) or []
+        found = [b for b in found if b.get("w", 0) > 0 and b.get("h", 0) > 0]
+        if found:
+            return found[0]
+    except Exception:
+        pass
+    try:
+        driver.execute_cdp_cmd("DOM.enable", {})
+        nodes = driver.execute_cdp_cmd("DOM.getFlattenedDocument", {"depth": -1, "pierce": True})["nodes"]
+        for n in nodes:
+            if n.get("nodeName") != "IFRAME":
+                continue
+            try:
+                m = driver.execute_cdp_cmd("DOM.getBoxModel", {"nodeId": n["nodeId"]})["model"]["content"]
+            except Exception:
+                continue
+            w, h = m[4] - m[0], m[5] - m[1]
+            if 240 <= w <= 360 and 50 <= h <= 90:
+                attrs = n.get("attributes") or []
+                html = "<iframe " + " ".join(f'{attrs[i]}="{attrs[i+1]}"' for i in range(0, len(attrs) - 1, 2)) + ">"
+                return {"x": m[0], "y": m[1], "w": w, "h": h, "how": "cdp-box", "html": html[:600]}
+    except Exception:
+        pass
+    return None
+
+
+def _cdp_click_turnstile(driver, box: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+    """Trusted click on the checkbox (≈20 px from the widget's left edge, vertically
+    centred) via Input.dispatchMouseEvent, with a short approach path first."""
+    x = box["x"] + 20 + random.uniform(-3, 3)
+    y = box["y"] + box["h"] / 2 + random.uniform(-3, 3)
+    try:
+        sx, sy = x - random.randint(120, 220), y + random.randint(80, 160)
+        steps = 8
+        for i in range(1, steps + 1):
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": sx + (x - sx) * i / steps, "y": sy + (y - sy) * i / steps, "button": "none"})
+            time.sleep(random.uniform(0.02, 0.05))
+        time.sleep(random.uniform(0.1, 0.25))
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1})
+        time.sleep(random.uniform(0.03, 0.08))
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1})
+        return int(x), int(y)
+    except Exception as e:
+        tprint(f"  [turnstile] CDP click failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _save_evidence(driver, domain: str, tag: str) -> Optional[str]:
+    """Screenshot into AHREF_EVIDENCE_DIR (if set) when Turnstile escalates."""
+    d = os.environ.get("AHREF_EVIDENCE_DIR")
+    if not d:
+        return None
+    try:
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"turnstile-{domain}-{tag}-{int(time.time())}.png")
+        driver.save_screenshot(path)
+        return path
+    except Exception:
+        return None
+
+
 def scrape_domain(driver, domain: str, mode: CheckerMode) -> Dict[str, Any]:
     """Process a single domain in the browser using the given mode."""
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.action_chains import ActionChains
-    from selenium.common.exceptions import WebDriverException
-
     t0 = time.time()
     row: Dict[str, Any] = {"domain_name": domain, "status": "error"}
 
@@ -768,6 +1095,8 @@ def scrape_domain(driver, domain: str, mode: CheckerMode) -> Dict[str, Any]:
 
         poll_deadline = time.time() + 45
         last_click = 0.0
+        clicks = 0
+        widget_seen = 0.0
 
         while time.time() < poll_deadline:
             try:
@@ -783,27 +1112,57 @@ def scrape_domain(driver, domain: str, mode: CheckerMode) -> Dict[str, Any]:
                 raw = done_payload["r"]
                 parsed = json.loads(raw) if isinstance(raw, str) else raw
                 if isinstance(parsed, dict) and "results" in parsed:
+                    ts = {k: v for k, v in row.items() if k.startswith("turnstile_")}
                     row = mode.extract_row(parsed, domain)
+                    row.update(ts)            # keep the checkbox evidence on the result row
                 break
 
             if done_payload.get("e") is not None:
                 row["error"] = done_payload["e"]
                 break
 
+            # Fast fail: Ahrefs shows "Something went wrong" within a few
+            # seconds when Cloudflare rejected this IP's captcha. Don't sit
+            # out the full modal timeout — flag it and leave immediately.
+            if _page_says_something_went_wrong(driver):
+                row["ip_blocked"] = True
+                row["error"] = "IP blocked: Ahrefs shows 'Something went wrong'"
+                break
+
+            # Interactive checkbox fallback (cf-autoclick cannot find the
+            # src-less widget iframe — see _find_turnstile_widget).
             now = time.time()
-            if now - last_click > 4:
-                try:
-                    for f in driver.find_elements(By.TAG_NAME, "iframe"):
-                        if "challenges.cloudflare.com" in (f.get_attribute("src") or ""):
-                            ActionChains(driver, duration=100).move_to_element_with_offset(
-                                f, random.randint(20, 35), random.randint(15, 25)
-                            ).pause(0.15).click().perform()
-                            last_click = now
-                            break
-                except (WebDriverException, Exception):
-                    pass
+            if now - last_click > TURNSTILE_CLICK_GAP_S:
+                box = _find_turnstile_widget(driver)
+                if box and not widget_seen:
+                    widget_seen = now
+                    row["turnstile_widget"] = True
+                    row["turnstile_widget_html"] = box.get("html")
+                    shot = _save_evidence(driver, domain, "widget")
+                    tprint(f"  [turnstile] {domain}: widget visible ({box['how']}, "
+                           f"{int(box['w'])}x{int(box['h'])} at {int(box['x'])},{int(box['y'])})"
+                           + (f" — {shot}" if shot else ""))
+                if (box and clicks < TURNSTILE_MAX_CLICKS and now - widget_seen >= TURNSTILE_CLICK_GRACE_S):
+                    # still there after the grace period: managed mode escalated to the checkbox
+                    if clicks == 0:
+                        row["turnstile_interactive"] = True
+                        _save_evidence(driver, domain, "checkbox")
+                    pt = _cdp_click_turnstile(driver, box)
+                    if pt:
+                        clicks += 1
+                        last_click = now
+                        tprint(f"  [turnstile] {domain}: click #{clicks} at {pt} "
+                               f"({now - widget_seen:.0f}s after the widget appeared)")
 
             time.sleep(1.0)
+
+        if row.get("turnstile_widget"):
+            row["turnstile_clicks"] = clicks
+            row["turnstile_widget_seconds"] = round(widget_seen - t0, 1)
+        if row.get("turnstile_widget") and row.get("status") != "completed":
+            shot = _save_evidence(driver, domain, "final")
+            if shot:
+                tprint(f"  [turnstile] {domain}: not solved after {clicks} click(s) — {shot}")
 
     except Exception as e:
         row["error"] = f"{type(e).__name__}: {e}"
@@ -818,6 +1177,480 @@ _print_lock = threading.Lock()
 def tprint(msg):
     with _print_lock:
         print(msg)
+
+
+# ----------------------------------------------------------------------------
+# Batch mode — one captcha, many domains.
+#
+# The authority checker page calls
+#     POST https://ahrefs.com/v4/stGetFreeWebsiteOverview
+#     {"url": "<domain>", "captcha": "<Cloudflare Turnstile token>"}
+# and the token is NOT single-use: for roughly four minutes the same token
+# answers for any domain, from plain HTTP, as long as the request carries the
+# browser's cookies, User-Agent and comes from the same exit IP. So in batch
+# mode we solve the captcha once in the real browser (which also yields the
+# first result), lift the token from the network log, and fan the remaining
+# domains out over the API at a moderate concurrency. When the token ages
+# out or starts being rejected we mint a fresh one with the next domain.
+#
+# Measured: ~1.5 s per API call, 5 concurrent ≈ 200 domains/min, sporadic
+# "InvalidCaptcha" / "InternalError" under load are transient and retried.
+# The traffic checker has no equivalent endpoint, so traffic domains still go
+# through the browser one by one.
+# ----------------------------------------------------------------------------
+
+AHREFS_OVERVIEW_API = "https://ahrefs.com/v4/stGetFreeWebsiteOverview"
+TOKEN_MAX_AGE_S = 180          # tokens die at ~240 s; refresh before that
+TOKEN_MINT_RETRIES = 3         # consecutive failed mints before giving up
+API_MAX_ATTEMPTS = 4           # per-domain API attempts (across tokens)
+
+
+class _TokenState:
+    def __init__(self):
+        self.token: Optional[str] = None
+        self.minted_at: float = 0.0
+        self.user_agent: str = ""
+        self.cookies: Dict[str, str] = {}
+        self.mints: int = 0
+
+    @property
+    def age(self) -> float:
+        return time.time() - self.minted_at if self.token else 1e9
+
+
+def _collect_turnstile_token(driver) -> Optional[str]:
+    """Read the captcha token the page just sent, from Chrome's perf log."""
+    token = None
+    try:
+        entries = driver.get_log("performance")
+    except Exception as e:
+        tprint(f"  [batch] cannot read performance log: {e}")
+        return None
+    for entry in entries:
+        try:
+            msg = json.loads(entry["message"])["message"]
+            if msg.get("method") != "Network.requestWillBeSent":
+                continue
+            req = msg["params"]["request"]
+            if "stGetFreeWebsiteOverview" not in req.get("url", ""):
+                continue
+            body = json.loads(req.get("postData") or "{}")
+            if body.get("captcha"):
+                token = body["captcha"]  # keep the latest
+        except Exception:
+            continue
+    return token
+
+
+def mint_token(driver, seed_domain: str, state: _TokenState) -> Dict[str, Any]:
+    """Run one real browser check for `seed_domain`; on success the Turnstile
+    token, cookies and UA are stored in `state`. Returns the seed's row."""
+    try:
+        driver.get_log("performance")  # drain old entries
+    except Exception:
+        pass
+    row = scrape_domain(driver, seed_domain, MODES["authority"])
+    token = _collect_turnstile_token(driver)
+    if token and row.get("status") == "completed":
+        state.token = token
+        state.minted_at = time.time()
+        state.mints += 1
+        try:
+            state.user_agent = driver.execute_script("return navigator.userAgent")
+            state.cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+        except Exception:
+            pass
+        tprint(f"  [batch] token #{state.mints} minted via {seed_domain} "
+               f"(len {len(token)}, browser {row.get('elapsed_seconds')}s)")
+    else:
+        tprint(f"  [batch] token mint via {seed_domain} FAILED: "
+               f"status={row.get('status')} token={'yes' if token else 'no'} "
+               f"error={row.get('error')}")
+        if row.get("ip_blocked") or _page_says_something_went_wrong(driver):
+            # Ahrefs shows this when Cloudflare rejected the captcha for this
+            # exit IP — i.e. the IP is already burned (shared proxy IPs often
+            # are). Retrying on the same IP never recovers; the caller closes
+            # this session and moves to a fresh IP.
+            row["ip_blocked"] = True
+            row["error"] = "IP blocked: Ahrefs shows 'Something went wrong'"
+            tprint(f"  [batch] *** IP BLOCKED *** ('Something went wrong' for {seed_domain} "
+                   f"after {row.get('elapsed_seconds')}s) — closing Chromium, next IP")
+    row["source"] = "browser"
+    return row
+
+
+def _page_says_something_went_wrong(driver) -> bool:
+    try:
+        txt = driver.execute_script(
+            "var m=document.querySelector('.ReactModalPortal [role=dialog]');"
+            "return (m ? m.innerText : document.body.innerText) || '';")
+        return "something went wrong" in (txt or "").lower()
+    except Exception:
+        return False
+
+
+def _api_session(state: _TokenState, proxy: Optional[str], concurrency: int) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": state.user_agent or "Mozilla/5.0",
+        "Origin": "https://ahrefs.com",
+        "Referer": "https://ahrefs.com/website-authority-checker/",
+        "Accept": "*/*",
+    })
+    s.cookies.update(state.cookies)
+    pr = proxy_for_requests(proxy)
+    if pr:
+        s.proxies.update(pr)
+    adapter = HTTPAdapter(pool_connections=concurrency, pool_maxsize=concurrency, max_retries=0)
+    s.mount("https://", adapter)
+    return s
+
+
+def api_authority_check(sess: requests.Session, domain: str, token: str,
+                        timeout: float = 60.0) -> Dict[str, Any]:
+    """One API call. Row has status 'completed' or 'error' with `error_kind`
+    in {'InvalidCaptcha', 'InternalError', 'http', 'exception', 'unknown'}."""
+    t0 = time.time()
+    row: Dict[str, Any] = {"domain_name": domain, "status": "error", "source": "api"}
+    try:
+        resp = sess.post(AHREFS_OVERVIEW_API,
+                         data=json.dumps({"url": domain, "captcha": token}),
+                         timeout=timeout)
+        if resp.status_code != 200:
+            row["error"] = f"HTTP {resp.status_code}"
+            row["error_kind"] = "http"
+        else:
+            body = resp.json()
+            if isinstance(body, list) and body and body[0] == "Ok" and isinstance(body[1], dict):
+                d = body[1]
+                row["dr"] = d.get("domainRating")
+                row["backlinks"] = d.get("backlinks")
+                row["linking_websites"] = d.get("refdomains")
+                row["backlinks_dofollow_percentage"] = d.get("dofollowBacklinks")
+                row["linking_websites_dofollow_percentage"] = d.get("dofollowRefdomains")
+                if row["dr"] is None and row["backlinks"] is None:
+                    row["error"] = "empty result"
+                    row["error_kind"] = "unknown"
+                elif (row["dr"] or 0) >= 1 and not row["backlinks"] and not row["linking_websites"]:
+                    # Ahrefs sometimes answers with the DR but zeroed link
+                    # counts when its backend is slow (seen on github.com,
+                    # google.com … right after a token mint). A DR>=1 site with
+                    # zero backlinks is impossible, so treat it as transient.
+                    row["error"] = f"partial result: DR {row['dr']} but zero backlinks"
+                    row["error_kind"] = "PartialResult"
+                else:
+                    row["status"] = "completed"
+            else:
+                detail = body[1] if isinstance(body, list) and len(body) > 1 else body
+                flat = json.dumps(detail)
+                row["error"] = flat[:200]
+                if "InvalidCaptcha" in flat:
+                    row["error_kind"] = "InvalidCaptcha"
+                elif "InternalError" in flat:
+                    row["error_kind"] = "InternalError"
+                else:
+                    row["error_kind"] = "unknown"
+    except Exception as e:
+        row["error"] = f"{type(e).__name__}: {str(e)[:150]}"
+        row["error_kind"] = "exception"
+    row["elapsed_seconds"] = round(time.time() - t0, 2)
+    row["finished_at"] = datetime.now(timezone.utc).isoformat()
+    return row
+
+
+class _Browser:
+    """Owns the single batch-mode browser so callers can restart it."""
+
+    def __init__(self, proxy_base: Optional[str] = None, **build_kwargs):
+        self.kw = build_kwargs
+        self.proxy_base = proxy_base          # as given on the CLI (no session)
+        self.proxy: Optional[str] = None      # current sticky session spec
+        self.exit_ip: Optional[str] = None
+        self.sessions = 0
+        self.driver = None
+        self.profile: Optional[str] = None
+        self.rotate_ip()
+
+    def rotate_ip(self, reason: Optional[str] = None) -> None:
+        """Close the browser, optionally record the current IP as burned, and
+        start a fresh browser on a NEW proxy session whose exit IP is not on
+        the burned list. Burned IPs are skipped with a cheap HTTP lookup —
+        Chromium is only opened once a clean IP is found."""
+        if reason and self.exit_ip:
+            mark_ip_burned(self.exit_ip, reason)
+        self.close()
+        if not self.proxy_base:
+            self.sessions += 1
+            self.proxy = None
+            self.kw["proxy"] = None
+            self.restart()
+            return
+        skipped = 0
+        for attempt in range(40):
+            self.sessions += 1
+            spec = make_sticky_proxy(self.proxy_base, session_id=uuid.uuid4().hex[:10])
+            ip = exit_ip_via_requests(spec)
+            burned = load_burned_ips()
+            if ip is None:
+                tprint(f"  [batch] session #{self.sessions}: proxy did not answer — next session")
+                continue
+            if ip in burned:
+                skipped += 1
+                tprint(f"  [batch] session #{self.sessions}: exit IP {ip} is on the burned list "
+                       f"(since {burned[ip][:19]}) — skipping, no browser opened")
+                continue
+            self.proxy = spec
+            self.exit_ip = ip
+            self.kw["proxy"] = spec
+            tprint(f"  [batch] session #{self.sessions}: exit IP {ip} is clean"
+                   + (f" ({skipped} burned IPs skipped)" if skipped else "") + " — opening Chromium")
+            self.restart()
+            return
+        raise RuntimeError("could not find a proxy exit IP that is not on the burned list "
+                           f"after 40 sessions ({skipped} burned); see {BURNED_IPS_PATH}")
+
+    def is_alive(self) -> bool:
+        if not _is_driver_alive(self.driver):
+            return False
+        try:
+            return bool(self.driver.window_handles)
+        except Exception:
+            return False
+
+    def ensure_alive(self) -> None:
+        if not self.is_alive():
+            tprint("  [batch] browser not responding — restarting it")
+            self.restart()
+
+    def restart(self) -> None:
+        self.close()
+        last_err = None
+        for attempt in range(5):
+            try:
+                self.driver, self.profile = build_driver(0, perf_log=True, **self.kw)
+                time.sleep(1)
+                if self.is_alive():
+                    return
+                raise RuntimeError("browser window closed right after start")
+            except Exception as e:
+                last_err = e
+                tprint(f"  [batch] browser start attempt {attempt+1}/5 failed: {e}")
+                self.close()
+                time.sleep(min(5 * (attempt + 1), 20))
+        raise RuntimeError(f"cannot start browser: {last_err}")
+
+    def close(self) -> None:
+        if self.driver is not None:
+            _quit_driver(self.driver)
+            self.driver = None
+        if self.profile:
+            _remove_worker_profile(self.profile)
+            self.profile = None
+
+
+def run_authority_batch(browser: "_Browser", domains: List[str], proxy: Optional[str],
+                        concurrency: int, pace: float,
+                        on_row: Callable[[Dict[str, Any]], None]) -> None:
+    """Resolve every domain in `domains` (authority mode) via token reuse."""
+    from collections import deque
+
+    state = _TokenState()
+    pending = deque(dict.fromkeys(d for d in domains if d))  # de-dup, keep order
+    attempts: Dict[str, int] = {}
+    mint_failures = 0        # consecutive failed mints on the current IP
+    rotations = 0            # consecutive IP rotations without a good mint
+    MAX_ROTATIONS = int(os.environ.get("AHREF_MAX_ROTATIONS", "10"))  # 0 = never take a second IP
+    total = len(pending)
+    done = 0
+    sess: Optional[requests.Session] = None
+
+    def finish(row: Dict[str, Any]) -> None:
+        nonlocal done
+        done += 1
+        row["mode"] = "authority"
+        on_row(row)
+
+    while pending:
+        # ── (re)mint when needed ────────────────────────────────────────
+        if state.token is None or state.age > TOKEN_MAX_AGE_S:
+            seed = pending.popleft()
+            browser.ensure_alive()
+            row = mint_token(browser.driver, seed, state)
+            minted = state.token is not None and state.age <= TOKEN_MAX_AGE_S
+            if not minted:
+                mint_failures += 1
+                # Rule: "Something went wrong" == this exit IP is burned (shared
+                # proxy IP used by someone else). Close Chromium, take a new
+                # Bright Data session (new IP) and retry the SAME domain.
+                # Any other mint failure gets one more try on this IP first.
+                if row.get("ip_blocked") or mint_failures >= 2 or not browser.is_alive():
+                    rotations += 1
+                    if rotations > MAX_ROTATIONS:
+                        tprint(f"  [batch] {rotations-1} IP rotations in a row without a working "
+                               f"captcha — giving up on {len(pending)+1} domains")
+                        finish(row)
+                        while pending:
+                            d = pending.popleft()
+                            finish({"domain_name": d, "status": "error", "source": "none",
+                                    "error": "no working proxy IP after repeated rotations"})
+                        return
+                    why = "IP blocked ('Something went wrong')" if row.get("ip_blocked") \
+                        else f"{mint_failures} failed captcha checks"
+                    tprint(f"  [batch] {why} on this IP — closing Chromium, new session")
+                    pending.appendleft(seed)       # retry same domain on the new IP
+                    mint_failures = 0
+                    browser.rotate_ip(reason=why)
+                    continue
+                pending.appendleft(seed)
+                time.sleep(3)
+                continue
+            mint_failures = 0
+            rotations = 0
+            finish(row)
+            sess = _api_session(state, browser.proxy, concurrency)
+            tprint(f"  [batch] progress {done}/{total}; firing API calls "
+                   f"({concurrency} concurrent, token age budget {TOKEN_MAX_AGE_S}s)")
+
+        # ── fan out one wave over the current token ────────────────────
+        wave = []
+        while pending and len(wave) < concurrency:
+            wave.append(pending.popleft())
+        token = state.token
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            rows = list(ex.map(lambda d: api_authority_check(sess, d, token), wave))
+
+        invalid = 0
+        partial = 0
+        for row in rows:
+            d = row["domain_name"]
+            if row["status"] == "completed":
+                finish(row)
+                continue
+            kind = row.get("error_kind")
+            if kind == "InvalidCaptcha":
+                invalid += 1
+            elif kind == "PartialResult":
+                partial += 1
+            attempts[d] = attempts.get(d, 0) + 1
+            if attempts[d] < API_MAX_ATTEMPTS:
+                pending.append(d)          # retry later (maybe with a new token)
+            else:
+                finish(row)
+        ok_n = sum(1 for r in rows if r["status"] == "completed")
+        tprint(f"  [batch] wave: {ok_n}/{len(rows)} ok"
+               + (f", {partial} partial (retry)" if partial else "")
+               + (f", {invalid} InvalidCaptcha" if invalid else "")
+               + f", token age {state.age:.0f}s, progress {done}/{total}, pending {len(pending)}")
+
+        if rows and invalid == len(rows):
+            # Every call in the wave was rejected — token is dead (expired or
+            # revoked). Force a fresh mint with the next domain.
+            tprint("  [batch] whole wave InvalidCaptcha — token dead, re-minting")
+            state.token = None
+        elif invalid or partial:
+            time.sleep(2)                  # back off a little; backend is struggling
+        if pace:
+            time.sleep(pace)
+
+
+def run_batch(domains: List[str], modes: List["CheckerMode"], proxy: Optional[str],
+              headless: bool, chrome_bin: Optional[str], version_main: Optional[int],
+              extension_path: Optional[str], out_path: str, concurrency: int,
+              pace: float, use_api: bool) -> Dict[str, Any]:
+    """Local batch run (no queue server). Writes rows to `out_path` as it goes."""
+    rows: List[Dict[str, Any]] = []
+    rows_lock = threading.Lock()
+    t_start = time.time()
+
+    def on_row(row: Dict[str, Any]) -> None:
+        with rows_lock:
+            rows.append(row)
+            snapshot = list(rows)
+        mark = "OK " if row.get("status") == "completed" else "FAIL"
+        if row.get("mode") == "authority":
+            tprint(f"  [{mark}][authority/{row.get('source','browser')}] {row['domain_name']} "
+                   f"DR={row.get('dr','-')} BL={row.get('backlinks','-')} "
+                   f"LW={row.get('linking_websites','-')}"
+                   + (f" err={row.get('error')}" if row.get("error") else ""))
+        else:
+            tprint(f"  [{mark}][traffic/browser] {row['domain_name']} "
+                   f"OT={row.get('organic_traffic','-')} TV={row.get('traffic_value','-')}"
+                   + (f" err={row.get('error')}" if row.get("error") else ""))
+        try:
+            tmp = out_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(snapshot, fh, indent=2)
+            os.replace(tmp, out_path)
+        except Exception as e:
+            tprint(f"  [batch] cannot write {out_path}: {e}")
+
+    proxy_short = parse_proxy(proxy)["host"] if proxy else "local IP"
+    tprint(f"[*] Batch: {len(domains)} domains, modes={[m.name for m in modes]}, "
+           f"proxy={proxy_short}, api={'on' if use_api else 'off'}, concurrency={concurrency}")
+
+    browser = _Browser(proxy_base=proxy, headless=headless, chrome_binary=chrome_bin,
+                       version_main=version_main, extension_path=extension_path)
+    try:
+        for mode in modes:
+            if mode.name == "authority" and use_api:
+                run_authority_batch(browser, domains, proxy, concurrency, pace, on_row)
+            else:
+                for i, d in enumerate(domains, 1):
+                    browser.ensure_alive()
+                    row = scrape_domain(browser.driver, d, mode)
+                    row["mode"] = mode.name
+                    row["source"] = "browser"
+                    on_row(row)
+                    if i % 50 == 0:
+                        tprint(f"  [batch] {i} browser checks — recycling browser")
+                        browser.restart()
+    finally:
+        browser.close()
+
+    elapsed = time.time() - t_start
+    summary: Dict[str, Any] = {"domains": len(domains), "elapsed_seconds": round(elapsed, 1),
+                               "out": out_path, "modes": {}}
+    for mode in modes:
+        mrows = [r for r in rows if r.get("mode") == mode.name]
+        ok = [r for r in mrows if r.get("status") == "completed"]
+        summary["modes"][mode.name] = {
+            "completed": len(ok), "failed": len(mrows) - len(ok),
+            "via_api": sum(1 for r in ok if r.get("source") == "api"),
+            "via_browser": sum(1 for r in ok if r.get("source") == "browser"),
+        }
+    tprint("\n[*] Batch summary: " + json.dumps(summary))
+    return summary
+
+
+def load_domains(path: Optional[str], inline: Optional[str]) -> List[str]:
+    """Domains from a file (one per line, '#' comments) and/or a comma/space/
+    newline separated inline string. Strips scheme/path, lowercases, de-dups."""
+    import re
+    raw: List[str] = []
+    if path:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue          # whole-line comments
+                raw += re.split(r"[\s,;]+", line.split("#", 1)[0])
+    if inline:
+        raw += re.split(r"[\s,;]+", inline)
+    out: List[str] = []
+    seen = set()
+    for item in raw:
+        item = item.strip()
+        if not item:
+            continue
+        item = re.sub(r"^[a-z]+://", "", item, flags=re.I)
+        item = item.split("/")[0].split("?")[0].strip().lower()
+        if item.startswith("www."):
+            item = item[4:]
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
 
 
 def pull_domain(api_url: str, mode: CheckerMode) -> Optional[Dict[str, Any]]:
@@ -943,6 +1776,34 @@ def _start_ahref_buffer_flusher(api_url: str, mode: CheckerMode) -> threading.Th
 # Browser healthcheck
 # ----------------------------------------------------------------------------
 
+def _quit_driver(driver, wait_s: float = 10.0) -> None:
+    """driver.quit() only SIGTERMs Chromium; wait for the process to actually
+    exit so the profile dir can be removed without racing its shutdown."""
+    pid = getattr(driver, "browser_pid", None)
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    if not pid:
+        return
+    import subprocess
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return                      # gone
+        # a reaped-but-zombie child still answers kill(0); check its state
+        try:
+            out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=2).stdout.strip()
+            if not out or out.startswith("Z"):
+                return
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+
 def _is_driver_alive(driver) -> bool:
     if driver is None:
         return False
@@ -968,11 +1829,7 @@ def worker_loop(worker_id: int, proxy: Optional[str], api_url: str, headless: bo
     def start_browser():
         nonlocal driver, profile_path
         if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-            time.sleep(2)
+            _quit_driver(driver)
         old_profile = profile_path
         if old_profile:
             _remove_worker_profile(old_profile)
@@ -1120,7 +1977,27 @@ def main():
     p.add_argument("--no-proxy", action="store_true", help="Disable proxies")
     p.add_argument("--webshare-proxy", action="store_true",
                    help="Use Webshare rotating proxy (p.webshare.io:9999 with IP auth)")
+    p.add_argument("--proxy", default=os.environ.get("AHREF_PROXY") or None,
+                   help="Single proxy for every worker: host:port or "
+                        "host:port:user:pass (env AHREF_PROXY). Bright Data "
+                        "proxies automatically get a per-worker sticky session.")
+    # ── batch mode (no queue server) ───────────────────────────────────────
+    b = p.add_argument_group("batch mode", "Check a fixed list of domains locally and "
+                             "write a JSON file instead of pulling from the queue.")
+    b.add_argument("--domains-file", help="File with one domain per line")
+    b.add_argument("--domains", help="Inline comma/space separated domains")
+    b.add_argument("--out", default="results.json", help="Output JSON (default results.json)")
+    b.add_argument("--concurrency", type=int, default=5,
+                   help="Parallel API calls per token in batch mode (default 5; "
+                        "10+ triggers Ahrefs rate limiting)")
+    b.add_argument("--pace", type=float, default=0.5,
+                   help="Seconds to sleep between API waves (default 0.5)")
+    b.add_argument("--no-api", action="store_true",
+                   help="Batch mode: run every domain through the browser instead of "
+                        "reusing one Turnstile token over the API")
     args = p.parse_args()
+
+    batch_mode = bool(args.domains_file or args.domains)
 
     # Resolve --modes / --mode
     raw_modes = args.modes if args.modes else (args.mode or "authority,traffic")
@@ -1131,7 +2008,7 @@ def main():
               file=sys.stderr)
         sys.exit(2)
     if not requested:
-        print(f"[FATAL] No modes given. Pass --modes authority,traffic.", file=sys.stderr)
+        print("[FATAL] No modes given. Pass --modes authority,traffic.", file=sys.stderr)
         sys.exit(2)
     enabled_modes = [MODES[m] for m in requested]
 
@@ -1185,14 +2062,45 @@ def main():
         # Give Webshare a moment to propagate the IP auth
         time.sleep(3)
 
+    if args.proxy and not args.no_proxy:
+        try:
+            parse_proxy(args.proxy)
+        except ValueError as e:
+            print(f"[FATAL] {e}", file=sys.stderr)
+            sys.exit(2)
+        proxies = [args.proxy]
+        print(f"[*] Proxy: {parse_proxy(args.proxy)['host']}:{parse_proxy(args.proxy)['port']} "
+              f"({'authenticated' if parse_proxy(args.proxy)['user'] else 'IP-authorised'})",
+              flush=True)
+
     if not args.no_proxy and not args.webshare_proxy and not proxies:
         print("[WARN] No proxies found. Running all instances on local IP.")
 
     chrome_bin = args.chrome or find_chrome_binary()
     version_main = detect_chrome_major(chrome_bin)
 
+    if batch_mode:
+        try:
+            domains = load_domains(args.domains_file, args.domains)
+        except OSError as e:
+            print(f"[FATAL] cannot read domains: {e}", file=sys.stderr)
+            sys.exit(2)
+        if not domains:
+            print("[FATAL] no domains to check", file=sys.stderr)
+            sys.exit(2)
+        proxy = proxies[0] if proxies else None
+        print("[*] Ahrefs Checker - Batch Mode")
+        print(f"[*] Chrome: {chrome_bin} (major {version_main})")
+        summary = run_batch(
+            domains, enabled_modes, proxy, args.headless, chrome_bin, version_main,
+            extension_path, args.out, max(1, args.concurrency), max(0.0, args.pace),
+            use_api=not args.no_api,
+        )
+        completed = sum(m["completed"] for m in summary["modes"].values())
+        sys.exit(0 if completed > 0 else 1)
+
     mode_summary = ", ".join(f"{m.name}->{m.endpoint}" for m in enabled_modes)
-    print(f"[*] Ahrefs Checker - Parallel Pull Mode")
+    print("[*] Ahrefs Checker - Parallel Pull Mode")
     print(f"[*] Modes: {mode_summary}")
     print(f"[*] API: {args.api_url}")
     print(f"[*] Chrome: {chrome_bin}")
@@ -1209,6 +2117,7 @@ def main():
         futures = []
         for i in range(num_workers):
             proxy = proxies[i % len(proxies)] if proxies else None
+            proxy = make_sticky_proxy(proxy, session_id=f"w{i}{uuid.uuid4().hex[:6]}")
             f = executor.submit(
                 worker_loop, i, proxy, args.api_url, args.headless,
                 chrome_bin, version_main, enabled_modes,

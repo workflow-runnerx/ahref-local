@@ -1,0 +1,199 @@
+name: Ahref Batch Check
+
+# Check a fixed list of domains (default: 200 in domains/sample-200.txt)
+# through a Bright Data proxy and wait for the result.
+#
+# How it works (see DOCUMENTATION.md "Batch mode"):
+#   * one real browser check solves the Cloudflare Turnstile captcha and
+#     yields a token; the token is reused over Ahrefs' own API for the rest
+#     of the list (5 concurrent calls, fresh token every ~3 minutes);
+#   * everything (browser + API calls) goes through ONE sticky Bright Data
+#     session so Cloudflare sees a single exit IP;
+#   * results.json + checker.log are uploaded as a workflow artifact and a
+#     summary table is written to the run's Summary tab.
+#
+# Proxy: add a repository secret BRIGHTDATA_PROXY with the value
+#   brd.superproxy.io:44445:brd-customer-<id>-zone-<zone>:<password>
+# or pass the same string in the "proxy" input for a one-off run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      domains:
+        description: 'Domains to check (comma/space/newline separated). Leave empty to use domains_file.'
+        required: false
+        default: ''
+        type: string
+      domains_file:
+        description: 'File in the repo with one domain per line (used when "domains" is empty)'
+        required: false
+        default: 'domains/sample-200.txt'
+        type: string
+      modes:
+        description: 'Which checker(s) to run'
+        required: true
+        default: 'authority'
+        type: choice
+        options:
+          - authority
+          - traffic
+          - authority,traffic
+      concurrency:
+        description: 'Parallel API calls per captcha token (authority). 5 is safe; 10+ gets rate limited.'
+        required: false
+        default: '5'
+        type: string
+      proxy:
+        description: 'Proxy host:port:user:pass (overrides the BRIGHTDATA_PROXY secret). Leave empty to use the secret.'
+        required: false
+        default: ''
+        type: string
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Xvfb and Chromium runtime libraries
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            xvfb libnss3 libatk-bridge2.0-0 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2t64 fonts-liberation
+          echo "✅ Xvfb + libs installed"
+
+      - name: Cache vendored chromium tarball
+        uses: actions/cache@v4
+        with:
+          path: vendor/ungoogled-chromium.tar.xz
+          key: ungoogled-chromium-${{ hashFiles('tools/setup_vendor.sh') }}
+
+      - name: Setup vendored chromium + cf-autoclick extension
+        timeout-minutes: 8
+        run: |
+          bash tools/setup_vendor.sh
+          test -x vendor/ungoogled-chromium/chrome \
+            || { echo "❌ vendor/ungoogled-chromium/chrome missing"; exit 1; }
+          test -f vendor/cf-autoclick/manifest.json \
+            || { echo "❌ vendor/cf-autoclick/manifest.json missing"; exit 1; }
+          echo "✅ Vendor setup complete"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: Prepare domain list
+        id: domains
+        env:
+          INPUT_DOMAINS: ${{ github.event.inputs.domains }}
+          INPUT_FILE: ${{ github.event.inputs.domains_file }}
+        run: |
+          if [ -n "$(printf '%s' "$INPUT_DOMAINS" | tr -d '[:space:],;')" ]; then
+            printf '%s\n' "$INPUT_DOMAINS" | tr ',; ' '\n\n\n' | sed '/^[[:space:]]*$/d' > domains-input.txt
+            echo "Using inline domains input"
+          else
+            test -f "$INPUT_FILE" || { echo "❌ domains_file not found: $INPUT_FILE"; exit 1; }
+            grep -v '^[[:space:]]*#' "$INPUT_FILE" | sed '/^[[:space:]]*$/d' > domains-input.txt
+            echo "Using $INPUT_FILE"
+          fi
+          COUNT=$(wc -l < domains-input.txt | tr -d ' ')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "✅ $COUNT domains queued"
+          head -5 domains-input.txt
+
+      - name: Resolve proxy
+        id: proxy
+        env:
+          INPUT_PROXY: ${{ github.event.inputs.proxy }}
+          SECRET_PROXY: ${{ secrets.BRIGHTDATA_PROXY }}
+        run: |
+          PROXY="${INPUT_PROXY:-$SECRET_PROXY}"
+          if [ -z "$PROXY" ]; then
+            echo "⚠️ No proxy given (input empty, secret BRIGHTDATA_PROXY unset) — running on the runner's own IP"
+            echo "flag=--no-proxy" >> "$GITHUB_OUTPUT"
+          else
+            echo "::add-mask::$PROXY"
+            PASS="${PROXY##*:}"
+            echo "::add-mask::$PASS"
+            echo "AHREF_PROXY=$PROXY" >> "$GITHUB_ENV"
+            echo "flag=" >> "$GITHUB_OUTPUT"
+            echo "✅ Proxy configured: ${PROXY%%:*} (credentials masked)"
+          fi
+
+      - name: Run Ahref batch check
+        id: run
+        env:
+          MODES: ${{ github.event.inputs.modes }}
+          CONCURRENCY: ${{ github.event.inputs.concurrency }}
+          PROXY_FLAG: ${{ steps.proxy.outputs.flag }}
+        run: |
+          set -o pipefail
+          echo "Checking ${{ steps.domains.outputs.count }} domains (modes=${MODES}, concurrency=${CONCURRENCY})"
+          # AHREF_PROXY (if set in the previous step) is picked up by --proxy's default.
+          xvfb-run -a -s "-screen 0 1280x900x24" \
+            python ahrefs_checker.py \
+              --domains-file domains-input.txt \
+              --out results.json \
+              --modes "${MODES}" \
+              --concurrency "${CONCURRENCY:-5}" \
+              ${PROXY_FLAG} 2>&1 | tee checker.log
+
+      - name: Write run summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, os
+          rows = []
+          try:
+              rows = json.load(open("results.json"))
+          except Exception as e:
+              print("no results.json:", e)
+          out = ["## Ahref batch result", ""]
+          for mode in sorted({r.get("mode", "?") for r in rows}):
+              mrows = [r for r in rows if r.get("mode") == mode]
+              ok = [r for r in mrows if r.get("status") == "completed"]
+              api = sum(1 for r in ok if r.get("source") == "api")
+              out.append(f"**{mode}**: {len(ok)} / {len(mrows)} completed "
+                         f"({api} via API token reuse, {len(ok)-api} via browser)")
+              out.append("")
+          if rows:
+              out.append("| domain | status | DR | backlinks | linking sites | organic traffic | error |")
+              out.append("|---|---|---|---|---|---|---|")
+              for r in rows[:300]:
+                  out.append("| {} | {} | {} | {} | {} | {} | {} |".format(
+                      r.get("domain_name"), r.get("status"), r.get("dr", ""),
+                      r.get("backlinks", ""), r.get("linking_websites", ""),
+                      r.get("organic_traffic", ""), (r.get("error") or "")[:60].replace("|", "/")))
+              if len(rows) > 300:
+                  out.append(f"\n… {len(rows)-300} more rows in the results.json artifact")
+          else:
+              out.append("_No rows produced — see checker.log in the artifact._")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write("\n".join(out) + "\n")
+          PY
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ahrefs-results-${{ github.run_number }}
+          path: |
+            results.json
+            checker.log
+          if-no-files-found: warn
+          retention-days: 14

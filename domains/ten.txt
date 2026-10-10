@@ -1,0 +1,10 @@
+botxbyte.com
+github.com
+example.com
+wikipedia.org
+python.org
+nytimes.com
+bbc.co.uk
+reddit.com
+stackoverflow.com
+medium.com

@@ -33,5 +33,13 @@ master-profile.zip
 # Vendored browser binary + extension (populated by tools/setup_vendor.sh,
 # one-time setup — never commit, too large / has its own .git)
 vendor/ungoogled-chromium/
-vendor/ungoogled-chromium.tar.xz
+vendor/ungoogled-chromium-*.tar.xz
 vendor/cf-autoclick/
+
+# Runtime list of proxy exit IPs that got blocked (grows while running)
+burned_ips.txt
+
+# Docker outputs / secrets
+out/
+docker/.env
+.DS_Store
