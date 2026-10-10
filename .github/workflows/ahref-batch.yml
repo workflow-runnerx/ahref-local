@@ -39,9 +39,9 @@ on:
           - traffic
           - authority,traffic
       concurrency:
-        description: 'Parallel API calls per captcha token (authority). 5 is safe; 10+ gets rate limited.'
+        description: 'API calls kept in flight per captcha token (authority). 30 measured: 200 domains in 58 s, rejections retried.'
         required: false
-        default: '5'
+        default: '30'
         type: string
       proxy:
         description: 'Proxy host:port:user:pass (overrides the BRIGHTDATA_PROXY secret). Leave empty to use the secret.'

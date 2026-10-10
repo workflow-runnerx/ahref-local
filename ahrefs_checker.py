@@ -52,7 +52,7 @@ import threading
 import time
 import uuid
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1512,46 +1512,69 @@ def run_authority_batch(browser: "_Browser", domains: List[str], proxy: Optional
             tprint(f"  [batch] progress {done}/{total}; firing API calls "
                    f"({concurrency} concurrent, token age budget {TOKEN_MAX_AGE_S}s)")
 
-        # ── fan out one wave over the current token ────────────────────
-        wave = []
-        while pending and len(wave) < concurrency:
-            wave.append(pending.popleft())
+        # ── rolling pool over the current token ─────────────────────────
+        # Keep `concurrency` calls in flight continuously. The old wave
+        # barrier made every group of N wait for its slowest member (a
+        # github.com-sized answer takes ~7 s, a small domain <1 s), which was
+        # most of a 200-domain run. Stops submitting when the token ages out
+        # or looks dead; the outer loop then re-mints.
         token = state.token
+        in_flight: Dict[Any, str] = {}
+        ok_n = err_n = invalid = partial = 0
+        consecutive_invalid = 0
+        token_dead = False
+        last_log = time.time()
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            rows = list(ex.map(lambda d: api_authority_check(sess, d, token), wave))
-
-        invalid = 0
-        partial = 0
-        for row in rows:
-            d = row["domain_name"]
-            if row["status"] == "completed":
-                finish(row)
-                continue
-            kind = row.get("error_kind")
-            if kind == "InvalidCaptcha":
-                invalid += 1
-            elif kind == "PartialResult":
-                partial += 1
-            attempts[d] = attempts.get(d, 0) + 1
-            if attempts[d] < API_MAX_ATTEMPTS:
-                pending.append(d)          # retry later (maybe with a new token)
-            else:
-                finish(row)
-        ok_n = sum(1 for r in rows if r["status"] == "completed")
-        tprint(f"  [batch] wave: {ok_n}/{len(rows)} ok"
-               + (f", {partial} partial (retry)" if partial else "")
-               + (f", {invalid} InvalidCaptcha" if invalid else "")
-               + f", token age {state.age:.0f}s, progress {done}/{total}, pending {len(pending)}")
-
-        if rows and invalid == len(rows):
-            # Every call in the wave was rejected — token is dead (expired or
-            # revoked). Force a fresh mint with the next domain.
-            tprint("  [batch] whole wave InvalidCaptcha — token dead, re-minting")
+            while pending or in_flight:
+                while (pending and len(in_flight) < concurrency
+                       and state.age <= TOKEN_MAX_AGE_S and not token_dead):
+                    d = pending.popleft()
+                    in_flight[ex.submit(api_authority_check, sess, d, token)] = d
+                    if pace:
+                        time.sleep(pace / concurrency)   # smooth the burst a little
+                if not in_flight:
+                    break                                # token aged out / dead → re-mint
+                done_set, _ = wait(list(in_flight), timeout=5, return_when=FIRST_COMPLETED)
+                for fut in done_set:
+                    d = in_flight.pop(fut)
+                    try:
+                        row = fut.result()
+                    except Exception as e:               # should not happen, api_authority_check catches
+                        row = {"domain_name": d, "status": "error", "source": "api",
+                               "error": f"{type(e).__name__}: {e}", "error_kind": "exception"}
+                    if row["status"] == "completed":
+                        finish(row)
+                        ok_n += 1
+                        consecutive_invalid = 0
+                        continue
+                    kind = row.get("error_kind")
+                    if kind == "InvalidCaptcha":
+                        invalid += 1
+                        consecutive_invalid += 1
+                    else:
+                        consecutive_invalid = 0
+                    if kind == "PartialResult":
+                        partial += 1
+                    err_n += 1
+                    attempts[d] = attempts.get(d, 0) + 1
+                    if attempts[d] < API_MAX_ATTEMPTS:
+                        pending.append(d)                # retry later (maybe with a new token)
+                    else:
+                        finish(row)
+                    if consecutive_invalid >= min(5, concurrency) and not token_dead:
+                        # A run of rejections means the token is dead (expired or
+                        # revoked), not a flaky call. Drain and force a fresh mint.
+                        token_dead = True
+                        tprint(f"  [batch] {consecutive_invalid} InvalidCaptcha in a row — token dead, re-minting")
+                now = time.time()
+                if now - last_log > 10 or not (pending or in_flight):
+                    tprint(f"  [batch] api: {ok_n} ok, {err_n} to retry"
+                           + (f" ({partial} partial, {invalid} InvalidCaptcha)" if partial or invalid else "")
+                           + f", in flight {len(in_flight)}, token age {state.age:.0f}s, "
+                           f"progress {done}/{total}, pending {len(pending)}")
+                    last_log = now
+        if token_dead:
             state.token = None
-        elif invalid or partial:
-            time.sleep(2)                  # back off a little; backend is struggling
-        if pace:
-            time.sleep(pace)
 
 
 def run_batch(domains: List[str], modes: List["CheckerMode"], proxy: Optional[str],
@@ -1987,11 +2010,12 @@ def main():
     b.add_argument("--domains-file", help="File with one domain per line")
     b.add_argument("--domains", help="Inline comma/space separated domains")
     b.add_argument("--out", default="results.json", help="Output JSON (default results.json)")
-    b.add_argument("--concurrency", type=int, default=5,
-                   help="Parallel API calls per token in batch mode (default 5; "
-                        "10+ triggers Ahrefs rate limiting)")
+    b.add_argument("--concurrency", type=int, default=int(os.environ.get("AHREF_CONCURRENCY", "30")),
+                   help="API calls kept in flight per token in batch mode (default 30, or "
+                        "AHREF_CONCURRENCY). Measured: 5 is clean, 10-20 see sporadic "
+                        "InternalError/InvalidCaptcha that the retries absorb")
     b.add_argument("--pace", type=float, default=0.5,
-                   help="Seconds to sleep between API waves (default 0.5)")
+                   help="Seconds of spacing spread over each batch of `concurrency` submissions (default 0.5)")
     b.add_argument("--no-api", action="store_true",
                    help="Batch mode: run every domain through the browser instead of "
                         "reusing one Turnstile token over the API")

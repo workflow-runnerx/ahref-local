@@ -62,7 +62,7 @@ Instead of pulling from the queue, batch mode takes a fixed list of domains, che
 
 1. One real browser check (through the proxy) solves the invisible Cloudflare Turnstile and returns the first result.
 2. The Turnstile token the page sent to `POST https://ahrefs.com/v4/stGetFreeWebsiteOverview` is read from Chrome's network log. That token is **not single-use**: for about 4 minutes it answers for any domain, from plain HTTP, as long as the request carries the browser's cookies, User-Agent and comes from the same exit IP.
-3. The remaining domains are sent straight to that API, `--concurrency` at a time (default 5). Measured: ~1.5 s per call, so 200 domains take roughly 1–2 minutes with one or two captchas.
+3. The remaining domains are sent straight to that API as a rolling pool of `--concurrency` calls in flight (default 30, or `AHREF_CONCURRENCY`). Ahrefs' endpoint takes one domain per request, so this is where the time goes: measured 2026-10-10 on the arm64 image, 200 domains in **58 s** with one captcha at 30 in flight, against 327 s with the old groups-of-5 barrier (every group waited for its slowest member, ~7 s for github.com-sized answers).
 4. Tokens are refreshed after 180 s or as soon as a whole wave comes back `InvalidCaptcha`; the next domain in the list is used for the new browser check, so nothing is wasted. Sporadic `InvalidCaptcha` / `InternalError` are retried up to 4 times.
 5. Results stream into `--out` after every domain (safe to read while running). API rows carry exact numbers (`backlinks: 4920490868`), browser rows carry the modal's abbreviated strings (`"4.9B"`); both have `source` set to `api` or `browser`.
 
@@ -72,12 +72,13 @@ Traffic mode has no reusable endpoint, so `--modes traffic` checks each domain i
 
 | Setting | Effect |
 |---|---|
-| 5 concurrent | clean, ~200 domains/min |
+| 5 in flight, groups of 5 | clean, 200 domains in 327 s (2 captchas) |
 | 10 concurrent | bursts of `InternalError` (rate limiting), retried |
 | 20 concurrent | ~1 in 8 rejected at random, still 173/200 in 34 s |
+| 30 in flight, rolling pool | 200/200 in 58 s, 1 captcha; 15 `InvalidCaptcha` + 2 partial retried, none lost |
 | ~500 fast calls from one browser build | Cloudflare flagged that browser's fingerprint for hours — every later check from it failed, on any IP |
 
-Keep `--concurrency` at 5 and spread volume across runs / proxies rather than pushing one browser harder.
+Default is now 30 in flight (retries absorb the ~8 % rejections); spread volume across runs / proxies rather than pushing one browser past ~500 calls per token.
 
 ### GitHub Actions workflow `ahref-batch.yml`
 
@@ -225,6 +226,8 @@ Brand note: the Mac runs Chromium 150, the container 155 (the oldest arm64 porta
 
 **200-domain batch, same image (run 4, exit IP 168.158.165.162):** `domains/sample-200.txt`, authority, `--concurrency 5`. 200/200 completed in 326.7 s on one IP: 2 browser checks (botxbyte.com 33.9 s, pexels.com 19.8 s for the 180 s token refresh — both showed the widget and were clicked once after the 6 s grace), 198 via the API (7 sporadic `InvalidCaptcha` retried, 1 partial), no rotation, no IP burned. Output `out/results-arm64-200.json`.
 
+**Rolling pool, 30 in flight (run 5, exit IP 66.17.193.77):** same 200 domains, 200/200 in **58.0 s**, 1 captcha (22.6 s), 199 API rows (avg 3.64 s, max 8.67 s), 15 `InvalidCaptcha` + 2 partial retried, no IP burned. Output `out/results-arm64-200-c30.json`.
+
 Still open: the invisible pass took 44.9 s against a 45 s poll deadline in run 3. If no-click runs start timing out, raise `poll_deadline` in `scrape_domain()` to 60 s before touching anything else.
 
 ### Is a container detectable? (`tools/probe_fingerprint.py`)
@@ -326,8 +329,8 @@ cd /home/sanket777/Desktop/Botxbyte/ahref-lambda
 | `--proxy SPEC` | env `AHREF_PROXY` | One proxy for all workers: `host:port` or `host:port:user:pass` (Bright Data gets sticky sessions automatically) |
 | `--domains-file FILE` / `--domains LIST` | — | **Batch mode**: check this list and exit instead of pulling from the queue |
 | `--out FILE` | results.json | Batch mode output |
-| `--concurrency N` | 5 | Batch mode: parallel API calls per Turnstile token |
-| `--pace SEC` | 0.5 | Batch mode: pause between API waves |
+| `--concurrency N` | 30 | Batch mode: API calls kept in flight per Turnstile token (rolling pool); env `AHREF_CONCURRENCY` |
+| `--pace SEC` | 0.5 | Batch mode: spacing spread over each `concurrency` submissions |
 | `--no-api` | off | Batch mode: browser check for every domain (no token reuse) |
 
 ---
