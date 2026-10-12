@@ -250,6 +250,16 @@ Brand note: the Mac runs Chromium 150, the container 155 (the oldest arm64 porta
 
 Still open: the invisible pass took 44.9 s against a 45 s poll deadline in run 3. If no-click runs start timing out, raise `poll_deadline` in `scrape_domain()` to 60 s before touching anything else.
 
+### Kubernetes (`k8s/ahref-local.yaml`, `.github/workflows/deploy-kube.yaml`)
+
+The production worker runs as a Deployment in the `domain-metrics` namespace, next to the management service, in queue batch mode against the service's in-cluster address (no gateway, no public hop). A push to `main` builds the **linux/amd64** image on the GitHub runner (native on the x86_64 nodes; the Rosetta failure was emulation, not x86), pushes it to Docker Hub as `<DOCKER_USERNAME>/ahref-local:<sha>` and rolls the Deployment.
+
+* Repository secrets: `DOCKER_USERNAME`, `DOCKER_PASSWORD`, `DOCKER_EMAIL`, `KUBE_CONFIG` (same values as `domain-metrics-management-service`) and `BRIGHTDATA_PROXY` (fallback proxy; the server's `proxy` setting wins). The workflow fails early with a clear message if one is missing.
+* Scale: `kubectl -n domain-metrics scale deploy/ahref-local --replicas=3`, or run the workflow by hand with a `replicas` input. Each replica leases its own batches on its own sticky proxy session; the burned-IP list is shared through the server.
+* Watch: `kubectl -n domain-metrics logs -f deploy/ahref-local`. Screenshots of Turnstile escalations land in `/app/out` inside the pod (`kubectl cp` them out); `burned_ips.txt` there is only the local cache.
+* Resources: 1 CPU / 2 Gi requested, 3 CPU / 4 Gi limit, 1 Gi `/dev/shm`. One Chromium plus 30 API calls in flight fits comfortably.
+* The GitHub Actions `ahref-vnc.yml` and `ahref-batch.yml` workflows still work for ad-hoc runs and for watching a browser over VNC.
+
 ### Is a container detectable? (`tools/probe_fingerprint.py`)
 
 Docker itself is invisible to a web page; what leaks are its side effects. The probe opens the checker's own browser (same undetected-chromedriver + extension + fingerprint proxy path) and dumps everything Cloudflare's challenge JS can read: `navigator.*` (webdriver, UA-CH brands, cores, memory, plugins), screen geometry, **WebGL vendor/renderer** (SwiftShader/llvmpipe = software GPU = VM/server), fonts, AudioContext, chromedriver globals, the JS timezone **vs the exit IP's timezone**, the TLS/h2 fingerprint the origin sees, and a bot.sannysoft.com screenshot. It prints a `flags` list of anything suspicious.

@@ -17,7 +17,7 @@ proxies.txt
 /tmp/proxies.txt
 
 # K8s (internal)
-k8s/
+# k8s/ is tracked (worker Deployment); was ignored by an old rule
 
 # Large test outputs
 results_500.json

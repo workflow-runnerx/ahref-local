@@ -1,0 +1,113 @@
+name: Build and Deploy ahref-local to Kubernetes
+
+# Builds the linux/amd64 image (native on the x86_64 nodes — no emulation,
+# which is what broke Cloudflare's Turnstile on the Mac) and rolls out the
+# queue-batch worker Deployment in the domain-metrics namespace.
+#
+# Repository secrets needed (same values as domain-metrics-management-service):
+#   DOCKER_USERNAME, DOCKER_PASSWORD, DOCKER_EMAIL   Docker Hub
+#   KUBE_CONFIG                                       base64 kubeconfig
+#   BRIGHTDATA_PROXY                                  host:port:user:pass (fallback proxy)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'domains/**'
+      - 'out/**'
+  workflow_dispatch:
+    inputs:
+      replicas:
+        description: 'Worker replicas (each leases its own batches on its own proxy session)'
+        required: false
+        default: '1'
+        type: string
+
+env:
+  KUBE_NAMESPACE: domain-metrics
+  KUBE_DEPLOYMENT: ahref-local
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+          BRIGHTDATA_PROXY: ${{ secrets.BRIGHTDATA_PROXY }}
+        run: |
+          missing=""
+          for v in DOCKER_USERNAME DOCKER_PASSWORD KUBE_CONFIG BRIGHTDATA_PROXY; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secret(s):$missing — copy them from domain-metrics-management-service (Settings → Secrets → Actions)"
+            exit 1
+          fi
+          echo "DOCKER_IMAGE=${DOCKER_USERNAME}/ahref-local" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push linux/amd64 image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+            ${{ env.DOCKER_IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.DOCKER_IMAGE }}:buildcache,mode=max
+
+      - name: Set up kubectl
+        run: |
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          kubectl cluster-info
+          kubectl get nodes -o wide
+
+      - name: Secrets in the cluster
+        run: |
+          kubectl create secret docker-registry ahref-local-image-pull-secret \
+            --docker-server=https://index.docker.io/v1/ \
+            --docker-username='${{ secrets.DOCKER_USERNAME }}' \
+            --docker-password='${{ secrets.DOCKER_PASSWORD }}' \
+            --docker-email='${{ secrets.DOCKER_EMAIL }}' \
+            --namespace="$KUBE_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic ahref-local \
+            --from-literal=BRIGHTDATA_PROXY='${{ secrets.BRIGHTDATA_PROXY }}' \
+            --namespace="$KUBE_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy
+        run: |
+          sed "s#__IMAGE__#${DOCKER_IMAGE}:${{ github.sha }}#" k8s/ahref-local.yaml | kubectl apply -f -
+          REPLICAS='${{ github.event.inputs.replicas }}'
+          if [ -n "$REPLICAS" ]; then
+            kubectl -n "$KUBE_NAMESPACE" scale deploy/"$KUBE_DEPLOYMENT" --replicas="$REPLICAS"
+          fi
+          kubectl -n "$KUBE_NAMESPACE" rollout status deploy/"$KUBE_DEPLOYMENT" --timeout=10m
+
+      - name: Show
+        run: |
+          kubectl -n "$KUBE_NAMESPACE" get pods -l app="$KUBE_DEPLOYMENT" -o wide
+          POD=$(kubectl -n "$KUBE_NAMESPACE" get pods -l app="$KUBE_DEPLOYMENT" -o jsonpath='{.items[0].metadata.name}')
+          sleep 20
+          kubectl -n "$KUBE_NAMESPACE" logs "$POD" --tail=40 || true

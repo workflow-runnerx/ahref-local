@@ -1,0 +1,93 @@
+# ahref-local worker on Kubernetes — queue batch mode against the management
+# service inside the cluster. Applied by .github/workflows/deploy-kube.yaml,
+# which substitutes __IMAGE__ and creates the `ahref-local` secret from the
+# BRIGHTDATA_PROXY repository secret.
+#
+#   kubectl -n domain-metrics logs -f deploy/ahref-local
+#   kubectl -n domain-metrics scale deploy/ahref-local --replicas=3   # more workers
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ahref-local
+  namespace: domain-metrics
+  labels:
+    app: ahref-local
+spec:
+  replicas: 1
+  # One worker at a time per replica: a rolling update would briefly run two
+  # browsers on two proxy sessions. Recreate keeps it simple.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ahref-local
+  template:
+    metadata:
+      labels:
+        app: ahref-local
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      terminationGracePeriodSeconds: 60
+      imagePullSecrets:
+        - name: ahref-local-image-pull-secret
+      containers:
+        - name: ahref-local
+          image: __IMAGE__
+          imagePullPolicy: Always
+          # entrypoint.sh starts Xvfb + pulseaudio, then runs ahrefs_checker.py
+          args:
+            - "--queue-batch"
+            - "--api-url"
+            - "http://domain-metrics-management-service.domain-metrics.svc.cluster.local:8902/domain-metrics-management-service/api/v1"
+          env:
+            - name: TZ
+              value: America/New_York
+            - name: SCREEN
+              value: 1920x1080x24
+            - name: AHREF_BURNED_IPS
+              value: /app/out/burned_ips.txt
+            - name: AHREF_EVIDENCE_DIR
+              value: /app/out
+            - name: AHREF_FP_IMPERSONATE
+              value: chrome
+            - name: AHREF_MAX_ROTATIONS
+              value: "3"
+            - name: AHREF_WORKER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Fallback proxy; the server's `proxy` setting wins when set.
+            - name: AHREF_PROXY
+              valueFrom:
+                secretKeyRef:
+                  name: ahref-local
+                  key: BRIGHTDATA_PROXY
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "3"
+              memory: 4Gi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: out
+              mountPath: /app/out
+            - name: fp-ca
+              mountPath: /home/ahref/.ahref-fp-proxy
+          livenessProbe:
+            exec:
+              command: ["pgrep", "-f", "ahrefs_checker.py"]
+            initialDelaySeconds: 60
+            periodSeconds: 60
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+        - name: out
+          emptyDir: {}
+        - name: fp-ca
+          emptyDir: {}

@@ -6,13 +6,13 @@
 #                                  --domains-file domains/sample-200.txt --modes authority
 # Fingerprint probe:           docker compose -f docker/docker-compose.yml run --rm probe
 #
-# linux/arm64: runs natively on Apple Silicon (Docker Desktop). The amd64
-# image under Rosetta failed Cloudflare's Turnstile outright (2026-10-10,
-# DOCUMENTATION.md "Docker Desktop run"); emulated CPU timing was the one
-# delta nothing else could remove. ungoogled-chromium ships arm64 portable
-# builds from 154 on. For an x86_64 host change the platform here and in
-# docker-compose.yml and drop the matching tarball in vendor/.
-FROM --platform=linux/arm64 ubuntu:24.04
+# Multi-arch: the build platform decides the Chromium tarball (setup_vendor.sh
+# reads `uname -m`). Locally docker-compose.yml pins linux/arm64 so it runs
+# natively on Apple Silicon — the amd64 image under Rosetta EMULATION failed
+# Cloudflare's Turnstile outright (2026-10-10, DOCUMENTATION.md "Docker
+# Desktop run"). On the x86_64 Kubernetes nodes the CI builds linux/amd64,
+# which runs natively there (.github/workflows/deploy-kube.yaml).
+FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ENV TZ=America/New_York \
@@ -66,11 +66,12 @@ RUN mv tools/requirements.txt . \
     && uv venv .venv --python 3.12 \
     && uv pip install --python .venv/bin/python -r requirements.txt
 
-# Vendored ungoogled-chromium + cf-autoclick. If the host already has the
-# arm64 tarball cached (vendor/ungoogled-chromium-arm64.tar.xz, gitignored)
-# it is copied in and the download is skipped; the extracted dir is never
-# copied (it may be for another architecture).
-COPY --chown=ahref:ahref vendor/ungoogled-chromium-arm64.tar.x[z] vendor/
+# Vendored ungoogled-chromium + cf-autoclick. A tarball cached on the host
+# (vendor/ungoogled-chromium-<arch>.tar.xz, gitignored; only the arm64 one is
+# let through .dockerignore) is copied in and the download skipped; otherwise
+# setup_vendor.sh downloads the build for the image's own architecture. The
+# extracted dir is never copied (it may be for another architecture).
+COPY --chown=ahref:ahref vendor/ungoogled-chromium-*.tar.x[z] vendor/
 RUN bash tools/setup_vendor.sh \
     && rm -f vendor/ungoogled-chromium-*.tar.xz \
     && vendor/ungoogled-chromium/chrome --version \
