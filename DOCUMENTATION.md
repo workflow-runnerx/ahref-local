@@ -96,6 +96,26 @@ Add the secret once: **Settings → Secrets and variables → Actions → New re
 
 The job installs Xvfb (no VNC/desktop needed — nobody has to watch it), runs `tools/setup_vendor.sh` for ungoogled-chromium + cf-autoclick, runs the batch under `xvfb-run`, writes a result table to the run's **Summary** tab and uploads `results.json` + `checker.log` as the artifact `ahrefs-results-<run number>`. A 200-domain authority run finishes in roughly 5 minutes including setup. The old `ahref-vnc.yml` is unchanged and still serves the queue/VNC use case.
 
+### Queue batch mode (`--queue-batch`) — the production path for the authority queue
+
+Instead of polling `GET /ahref-authority/` one record at a time, the worker leases a whole batch from the management service and posts results in bulk. Batch size, API concurrency and the proxy are **server settings** (`ahref_worker_settings`, `PUT /ahref-authority/settings`), so the team tunes them without redeploying workers. Server side: `domain-metrics-management-service`, `docs/ahref-authority-batch.md`.
+
+```bash
+.venv/bin/python ahrefs_checker.py --queue-batch                       # forever
+.venv/bin/python ahrefs_checker.py --queue-batch --max-batches 1       # one batch, then exit
+DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose -f docker/docker-compose.yml run --rm checker --queue-batch
+```
+
+Per batch:
+
+1. `GET {api}/ahref-authority/batch` → `{batch_id, batch_size, concurrency, proxy, burned_ips, records[]}`; 204 means sleep 10 s and pull again.
+2. Every IP in `burned_ips` goes into the local `burned_ips.txt` (not re-reported). `proxy` from the server wins over `--proxy` / `AHREF_PROXY`; the worker still appends its own sticky `-session-<id>`.
+3. The records' domains run through the same batch engine as `--domains-file` (one captcha, rolling pool of `concurrency` API calls, token refresh, IP rotation).
+4. Results are posted as `{batch_id, rows:[{execution_record, result}]}` every 25 rows and at the end. A failed post is appended to `ahref_batch_post_buffer.jsonl` and re-sent before the next pull; the server accepts a duplicate once.
+5. An IP the worker burns is written locally and reported to `POST /ahref-authority/burned-ips`, so every other worker skips it on its next pull.
+
+The lease is 15 min by default; a 200-batch takes about a minute. Traffic mode has no batch form and keeps the per-record loop (`--modes traffic`).
+
 ### Proxies: Bright Data and authenticated proxies in general
 
 * `--proxy host:port:user:pass` (or env `AHREF_PROXY`) works for both batch and queue mode and for every worker.

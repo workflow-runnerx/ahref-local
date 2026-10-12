@@ -631,7 +631,13 @@ def load_burned_ips(path: str = BURNED_IPS_PATH) -> Dict[str, str]:
     return out
 
 
-def mark_ip_burned(ip: Optional[str], reason: str, path: str = BURNED_IPS_PATH) -> None:
+# Set by queue batch mode: called with (ip, reason) after a NEW burn is written
+# locally so the server's shared list learns about it (best effort).
+_BURNED_REPORTER: Optional[Callable[[str, str], None]] = None
+
+
+def mark_ip_burned(ip: Optional[str], reason: str, path: str = BURNED_IPS_PATH,
+                   report: bool = True) -> None:
     if not ip:
         return
     with _BURNED_LOCK:
@@ -646,6 +652,11 @@ def mark_ip_burned(ip: Optional[str], reason: str, path: str = BURNED_IPS_PATH) 
             tprint(f"  [burned] {ip} added to {os.path.basename(path)} ({reason})")
         except Exception as e:
             tprint(f"  [burned] cannot write {path}: {e}")
+    if report and _BURNED_REPORTER is not None:
+        try:
+            _BURNED_REPORTER(ip, reason)
+        except Exception as e:
+            tprint(f"  [burned] server report failed for {ip}: {e}")
 
 
 def exit_ip_via_requests(spec: Optional[str], timeout: float = 15.0) -> Optional[str]:
@@ -1646,6 +1657,211 @@ def run_batch(domains: List[str], modes: List["CheckerMode"], proxy: Optional[st
     return summary
 
 
+# ----------------------------------------------------------------------------
+# Queue batch mode — pull a leased batch from the management service, run the
+# authority batch engine over it, post results in bulk.
+#
+#   GET  {api}/ahref-authority/batch        -> {batch_id, batch_size, concurrency,
+#                                               proxy, burned_ips, records[]}  (204 = empty)
+#   POST {api}/ahref-authority/batch        <- {batch_id, rows:[{execution_record, result}]}
+#   POST {api}/ahref-authority/burned-ips   <- {ip, when, reason, reported_by}
+#
+# batch_size / concurrency / proxy are the SERVER's values (ahref_worker_settings);
+# the CLI proxy is only the fallback when the server sends none. See
+# DOCUMENTATION.md "Queue batch mode".
+# ----------------------------------------------------------------------------
+
+BATCH_PULL_PATH = "/ahref-authority/batch"
+BATCH_POST_PATH = "/ahref-authority/batch"
+BURNED_IPS_PATH_API = "/ahref-authority/burned-ips"
+BATCH_POST_CHUNK = 25
+BATCH_POST_BUFFER = os.environ.get(
+    "AHREF_BATCH_POST_BUFFER",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ahref_batch_post_buffer.jsonl"))
+_batch_buffer_lock = threading.Lock()
+
+
+def pull_batch(api_url: str) -> Optional[Dict[str, Any]]:
+    """One batch pull. None on an empty queue (204) or on error."""
+    try:
+        resp = _HTTP.get(f"{api_url}{BATCH_PULL_PATH}", timeout=(10, 60))
+        if resp.status_code == 204:
+            return None
+        resp.raise_for_status()
+        body = resp.json()
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, dict) or not data.get("records"):
+            return None
+        return data
+    except Exception as e:
+        tprint(f"  [pull] batch pull error: {e}")
+        return None
+
+
+def post_batch_rows(api_url: str, batch_id: Optional[str], rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Bulk post. Returns the server's {accepted, rejected} or None on failure."""
+    if not rows:
+        return {"accepted": [], "rejected": {}}
+    try:
+        resp = _HTTP.post(f"{api_url}{BATCH_POST_PATH}",
+                          json={"batch_id": batch_id, "rows": rows}, timeout=(10, 120))
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("success"):
+            return None
+        return body.get("data") or {"accepted": [], "rejected": {}}
+    except Exception as e:
+        tprint(f"  [post] batch post error ({len(rows)} rows): {e}")
+        return None
+
+
+def _buffer_batch_rows(batch_id: Optional[str], rows: List[Dict[str, Any]]) -> None:
+    try:
+        with _batch_buffer_lock:
+            with open(BATCH_POST_BUFFER, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": datetime.now(timezone.utc).isoformat(),
+                                     "batch_id": batch_id, "rows": rows}) + "\n")
+        tprint(f"  [post] buffered {len(rows)} rows to {os.path.basename(BATCH_POST_BUFFER)}")
+    except Exception as e:
+        print(f"  [buffer] FATAL: cannot write batch post buffer: {e}", flush=True)
+
+
+def _flush_batch_buffer(api_url: str) -> int:
+    """Re-send buffered chunks; the server accepts duplicates once."""
+    if not os.path.exists(BATCH_POST_BUFFER):
+        return 0
+    sent = 0
+    remaining: List[str] = []
+    with _batch_buffer_lock:
+        try:
+            with open(BATCH_POST_BUFFER, "r", encoding="utf-8") as fh:
+                lines = [ln.strip() for ln in fh if ln.strip()]
+        except Exception:
+            return 0
+        for line in lines:
+            try:
+                obj = json.loads(line)
+                if post_batch_rows(api_url, obj.get("batch_id"), obj.get("rows") or []) is not None:
+                    sent += len(obj.get("rows") or [])
+                    continue
+            except Exception:
+                pass
+            remaining.append(line)
+        try:
+            with open(BATCH_POST_BUFFER, "w", encoding="utf-8") as fh:
+                for ln in remaining:
+                    fh.write(ln + "\n")
+        except Exception:
+            pass
+    if sent:
+        tprint(f"  [post] re-sent {sent} buffered rows")
+    return sent
+
+
+def report_burned_ip(api_url: str, ip: str, reason: str, reported_by: str) -> None:
+    try:
+        _HTTP.post(f"{api_url}{BURNED_IPS_PATH_API}",
+                   json={"ip": ip, "when": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                         "reason": reason, "reported_by": reported_by},
+                   timeout=(10, 30))
+        tprint(f"  [burned] {ip} reported to the server")
+    except Exception as e:
+        tprint(f"  [burned] could not report {ip} to the server: {e}")
+
+
+def run_queue_batches(api_url: str, cli_proxy: Optional[str], headless: bool,
+                      chrome_bin: Optional[str], version_main: Optional[int],
+                      extension_path: Optional[str], concurrency_cli: int, pace: float,
+                      idle_sleep: float = 10.0, max_batches: int = 0) -> None:
+    """Pull → run → post, forever (or `max_batches` times). Authority only."""
+    global _BURNED_REPORTER
+    import socket
+    worker_name = os.environ.get("AHREF_WORKER_NAME") or socket.gethostname()
+    _BURNED_REPORTER = lambda ip, reason: report_burned_ip(api_url, ip, reason, worker_name)
+
+    browser: Optional[_Browser] = None
+    current_proxy_base: Optional[str] = None
+    batches = 0
+    tprint(f"[*] Queue batch mode: {api_url}{BATCH_PULL_PATH} (worker {worker_name})")
+    try:
+        while True:
+            _flush_batch_buffer(api_url)
+            batch = pull_batch(api_url)
+            if batch is None:
+                time.sleep(idle_sleep)
+                continue
+            batches += 1
+            batch_id = batch.get("batch_id")
+            records = [r for r in batch.get("records") or [] if isinstance(r, dict)]
+            for ip in batch.get("burned_ips") or []:
+                mark_ip_burned(str(ip), "server list", report=False)
+            proxy_base = batch.get("proxy") or cli_proxy
+            try:
+                concurrency = max(1, int(batch.get("concurrency") or concurrency_cli))
+            except (TypeError, ValueError):
+                concurrency = concurrency_cli
+            tprint(f"  [queue] batch {batch_id}: {len(records)} records, concurrency {concurrency}, "
+                   f"proxy {'server' if batch.get('proxy') else ('cli' if cli_proxy else 'none')}, "
+                   f"{len(batch.get('burned_ips') or [])} burned IPs from server")
+
+            if browser is None or proxy_base != current_proxy_base:
+                if browser is not None:
+                    browser.close()
+                browser = _Browser(proxy_base=proxy_base, headless=headless, chrome_binary=chrome_bin,
+                                   version_main=version_main, extension_path=extension_path)
+                current_proxy_base = proxy_base
+
+            by_domain: Dict[str, List[Dict[str, Any]]] = {}
+            for rec in records:
+                d = str(rec.get("domain_name") or "").strip().lower()
+                if d:
+                    by_domain.setdefault(d, []).append(rec)
+            pending_rows: List[Dict[str, Any]] = []
+            lock = threading.Lock()
+            posted = {"ok": 0, "rejected": 0}
+
+            def flush() -> None:
+                with lock:
+                    rows, pending_rows[:] = list(pending_rows), []
+                if not rows:
+                    return
+                data = post_batch_rows(api_url, batch_id, rows)
+                if data is None:
+                    _buffer_batch_rows(batch_id, rows)
+                    return
+                posted["ok"] += len(data.get("accepted") or [])
+                rejected = data.get("rejected") or {}
+                posted["rejected"] += len(rejected)
+                for rid, why in list(rejected.items())[:5]:
+                    tprint(f"  [post] rejected {rid}: {why}")
+
+            def on_row(row: Dict[str, Any]) -> None:
+                recs = by_domain.get(str(row.get("domain_name") or "").lower(), [])
+                mark = "OK " if row.get("status") == "completed" else "FAIL"
+                tprint(f"  [{mark}][authority/{row.get('source', 'browser')}] {row.get('domain_name')} "
+                       f"DR={row.get('dr', '-')} BL={row.get('backlinks', '-')}"
+                       + (f" err={row.get('error')}" if row.get("error") else ""))
+                with lock:
+                    for rec in recs:
+                        pending_rows.append({"execution_record": rec, "result": row})
+                    due = len(pending_rows) >= BATCH_POST_CHUNK
+                if due:
+                    flush()
+
+            t0 = time.time()
+            run_authority_batch(browser, list(by_domain), browser.proxy_base, concurrency, pace, on_row)
+            flush()
+            tprint(f"  [queue] batch {batch_id} done in {time.time() - t0:.0f}s: "
+                   f"{posted['ok']} accepted, {posted['rejected']} rejected")
+            if max_batches and batches >= max_batches:
+                return
+    except KeyboardInterrupt:
+        tprint("\n[*] Shutting down queue batch mode...")
+    finally:
+        if browser is not None:
+            browser.close()
+
+
 def load_domains(path: Optional[str], inline: Optional[str]) -> List[str]:
     """Domains from a file (one per line, '#' comments) and/or a comma/space/
     newline separated inline string. Strips scheme/path, lowercases, de-dups."""
@@ -2019,6 +2235,13 @@ def main():
     b.add_argument("--no-api", action="store_true",
                    help="Batch mode: run every domain through the browser instead of "
                         "reusing one Turnstile token over the API")
+    p.add_argument("--queue-batch", action="store_true",
+                   help="Authority queue in batches: pull a leased batch from "
+                        "GET /ahref-authority/batch (batch_size, concurrency and proxy "
+                        "come from the server), run the batch engine, post results in "
+                        "bulk. Replaces the per-record poll for the authority queue.")
+    p.add_argument("--max-batches", type=int, default=0,
+                   help="Queue batch mode: stop after N batches (0 = run forever)")
     args = p.parse_args()
 
     batch_mode = bool(args.domains_file or args.domains)
@@ -2122,6 +2345,16 @@ def main():
         )
         completed = sum(m["completed"] for m in summary["modes"].values())
         sys.exit(0 if completed > 0 else 1)
+
+    if args.queue_batch:
+        proxy = proxies[0] if proxies else None
+        print("[*] Ahrefs Checker - Queue Batch Mode (authority)")
+        print(f"[*] API: {args.api_url}")
+        print(f"[*] Chrome: {chrome_bin} (major {version_main})")
+        run_queue_batches(args.api_url, proxy, args.headless, chrome_bin, version_main,
+                          extension_path, max(1, args.concurrency), max(0.0, args.pace),
+                          max_batches=max(0, args.max_batches))
+        return
 
     mode_summary = ", ".join(f"{m.name}->{m.endpoint}" for m in enabled_modes)
     print("[*] Ahrefs Checker - Parallel Pull Mode")
