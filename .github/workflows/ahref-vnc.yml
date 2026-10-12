@@ -18,6 +18,10 @@ on:
         default: '1'
 
 env:
+  # Stop after 3 fresh proxy sessions without a working captcha: on a host
+  # Cloudflare rejects, every further rotation only burns another IP (the
+  # 2026-10-12 x86 runner test burned 10 before the 10-rotation default stopped).
+  AHREF_MAX_ROTATIONS: "3"
   DISPLAY: ":1"
   VNC_PORT: 5901
   NOVNC_PORT: 6080

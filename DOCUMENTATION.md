@@ -259,6 +259,7 @@ The production worker runs as a Deployment in the `domain-metrics` namespace, ne
 * Watch: `kubectl -n domain-metrics logs -f deploy/ahref-local`. Screenshots of Turnstile escalations land in `/app/out` inside the pod (`kubectl cp` them out); `burned_ips.txt` there is only the local cache.
 * Resources: 1 CPU / 2 Gi requested, 3 CPU / 4 Gi limit, 1 Gi `/dev/shm`. One Chromium plus 30 API calls in flight fits comfortably.
 * The GitHub Actions `ahref-vnc.yml` and `ahref-batch.yml` workflows still work for ad-hoc runs and for watching a browser over VNC.
+* **Open question, x86 VMs.** The first native-x86 check (2026-10-12, `ahref-batch.yml` on a GitHub `ubuntu-latest` runner, Chromium 155 x86_64, one domain) failed 10 of 10 captcha attempts across 5 proxy sessions and burned 10 IPs before the rotation cap stopped it. The checkbox clicks landed 40 s after the widget appeared instead of 6 s, so the runner was CPU-starved as well as fingerprinted as a GPU-less VM. The arm64 image on Docker Desktop passes the same check every time. The cluster nodes are also GPU-less VMs; treat the first one-domain run there as the deciding test, and if it fails, keep the workers on Apple Silicon hosts pulling from the server (the pull design does not care where the worker runs). Both workflows now cap rotations at 3 (`AHREF_MAX_ROTATIONS`).
 
 ### Is a container detectable? (`tools/probe_fingerprint.py`)
 
