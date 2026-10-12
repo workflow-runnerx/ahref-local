@@ -109,7 +109,7 @@ DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose -f docker/docker-compose.yml 
 Per batch:
 
 1. `GET {api}/ahref-authority/batch` → `{batch_id, batch_size, concurrency, proxy, burned_ips, records[]}`; 204 means sleep 10 s and pull again.
-2. Every IP in `burned_ips` goes into the local `burned_ips.txt` (not re-reported). `proxy` from the server wins over `--proxy` / `AHREF_PROXY`; the worker still appends its own sticky `-session-<id>`.
+2. Every IP in `burned_ips` goes into the local `burned_ips.txt` (not re-reported). `proxy` from the server wins over `--proxy` / `AHREF_PROXY`; the worker still appends its own sticky `-session-<id>`. The server rotates its proxy account pool (`/ahref-proxy-accounts/`, least-recently-used active account per batch) and names the one it chose in `proxy_account`.
 3. The records' domains run through the same batch engine as `--domains-file` (one captcha, rolling pool of `concurrency` API calls, token refresh, IP rotation).
 4. Results are posted as `{batch_id, rows:[{execution_record, result}]}` every 25 rows and at the end. A failed post is appended to `ahref_batch_post_buffer.jsonl` and re-sent before the next pull; the server accepts a duplicate once.
 5. An IP the worker burns is written locally and reported to `POST /ahref-authority/burned-ips`, so every other worker skips it on its next pull.

@@ -1800,9 +1800,10 @@ def run_queue_batches(api_url: str, cli_proxy: Optional[str], headless: bool,
                 concurrency = max(1, int(batch.get("concurrency") or concurrency_cli))
             except (TypeError, ValueError):
                 concurrency = concurrency_cli
+            proxy_src = (f"server account {batch.get('proxy_account')}" if batch.get("proxy_account")
+                         else ("server" if batch.get("proxy") else ("cli" if cli_proxy else "none")))
             tprint(f"  [queue] batch {batch_id}: {len(records)} records, concurrency {concurrency}, "
-                   f"proxy {'server' if batch.get('proxy') else ('cli' if cli_proxy else 'none')}, "
-                   f"{len(batch.get('burned_ips') or [])} burned IPs from server")
+                   f"proxy {proxy_src}, {len(batch.get('burned_ips') or [])} burned IPs from server")
 
             if browser is None or proxy_base != current_proxy_base:
                 if browser is not None:
