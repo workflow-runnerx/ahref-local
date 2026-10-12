@@ -5,7 +5,7 @@ name: Build and Deploy ahref-local to Kubernetes
 # queue-batch worker Deployment in the domain-metrics namespace.
 #
 # Repository secrets needed (same values as domain-metrics-management-service):
-#   DOCKER_USERNAME, DOCKER_PASSWORD, DOCKER_EMAIL   Docker Hub
+#   DOCKER_USERNAME, DOCKER_PASSWORD                 Docker Hub
 #   KUBE_CONFIG                                       base64 kubeconfig
 #   BRIGHTDATA_PROXY                                  host:port:user:pass (fallback proxy)
 
@@ -90,7 +90,6 @@ jobs:
             --docker-server=https://index.docker.io/v1/ \
             --docker-username='${{ secrets.DOCKER_USERNAME }}' \
             --docker-password='${{ secrets.DOCKER_PASSWORD }}' \
-            --docker-email='${{ secrets.DOCKER_EMAIL }}' \
             --namespace="$KUBE_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
           kubectl create secret generic ahref-local \
             --from-literal=BRIGHTDATA_PROXY='${{ secrets.BRIGHTDATA_PROXY }}' \

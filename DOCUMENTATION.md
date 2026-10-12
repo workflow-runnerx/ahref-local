@@ -48,9 +48,9 @@ Exit code is 0 only when every domain/mode completed.
 
 ---
 
-## Batch mode — one captcha, many domains (GitHub Actions)
+## Batch mode — one captcha, many domains
 
-Instead of pulling from the queue, batch mode takes a fixed list of domains, checks them and writes a JSON file. It is what `.github/workflows/ahref-batch.yml` runs.
+Instead of pulling from the queue, batch mode takes a fixed list of domains, checks them and writes a JSON file. It is what the local Docker run and the Kubernetes test job (`ahref-local k8s test` in `domain-metrics-management-service`) use.
 
 ```bash
 .venv/bin/python ahrefs_checker.py --domains-file domains/sample-200.txt --out results.json \
@@ -80,21 +80,9 @@ Traffic mode has no reusable endpoint, so `--modes traffic` checks each domain i
 
 Default is now 30 in flight (retries absorb the ~8 % rejections); spread volume across runs / proxies rather than pushing one browser past ~500 calls per token.
 
-### GitHub Actions workflow `ahref-batch.yml`
+### GitHub Actions workflows: removed 2026-10-12
 
-Trigger it from the Actions tab ("Ahref Batch Check" → Run workflow):
-
-| Input | Default | Meaning |
-|---|---|---|
-| `domains` | empty | Inline list (comma/space/newline separated). Empty → use `domains_file`. |
-| `domains_file` | `domains/sample-200.txt` | File in the repo, one domain per line, `#` comments allowed |
-| `modes` | `authority` | `authority`, `traffic` or both |
-| `concurrency` | `5` | Parallel API calls per token |
-| `proxy` | empty | `host:port:user:pass`; empty → repository secret `BRIGHTDATA_PROXY` |
-
-Add the secret once: **Settings → Secrets and variables → Actions → New repository secret**, name `BRIGHTDATA_PROXY`, value `brd.superproxy.io:44445:brd-customer-<id>-zone-<zone>:<password>`. The value and the password are masked in logs.
-
-The job installs Xvfb (no VNC/desktop needed — nobody has to watch it), runs `tools/setup_vendor.sh` for ungoogled-chromium + cf-autoclick, runs the batch under `xvfb-run`, writes a result table to the run's **Summary** tab and uploads `results.json` + `checker.log` as the artifact `ahrefs-results-<run number>`. A 200-domain authority run finishes in roughly 5 minutes including setup. The old `ahref-vnc.yml` is unchanged and still serves the queue/VNC use case.
+`ahref-vnc.yml` and `ahref-batch.yml` are gone. GitHub's hosted runners fail Cloudflare Turnstile (10 of 10 attempts, 10 IPs burned on 2026-10-12), while the same image passes on the cluster, so the Ahrefs checker now runs only as the `ahref-local` Deployment on Kubernetes. The Workflow Runner page in the Domain Metrics UI scales that Deployment (its target is the replica count); nothing dispatches this repository's workflows any more. `deploy-kube.yaml` builds and rolls the Deployment on every push to `main`.
 
 ### Queue batch mode (`--queue-batch`) — the production path for the authority queue
 
@@ -258,9 +246,9 @@ The production worker runs as a Deployment in the `domain-metrics` namespace, ne
 * Scale: `kubectl -n domain-metrics scale deploy/ahref-local --replicas=3`, or run the workflow by hand with a `replicas` input. Each replica leases its own batches on its own sticky proxy session; the burned-IP list is shared through the server.
 * Watch: `kubectl -n domain-metrics logs -f deploy/ahref-local`. Screenshots of Turnstile escalations land in `/app/out` inside the pod (`kubectl cp` them out); `burned_ips.txt` there is only the local cache.
 * Resources: 1 CPU / 2 Gi requested, 3 CPU / 4 Gi limit, 1 Gi `/dev/shm`. One Chromium plus 30 API calls in flight fits comfortably.
-* The GitHub Actions `ahref-vnc.yml` and `ahref-batch.yml` workflows still work for ad-hoc runs and for watching a browser over VNC.
-* **Result 2026-10-12, x86 hosts.** A GitHub `ubuntu-latest` runner (`ahref-batch.yml`, Chromium 155 x86_64, one domain) failed 10 of 10 captcha attempts across 5 proxy sessions and burned 10 IPs: its clicks landed 40 s after the widget instead of 6 s, so that runner is CPU-starved. The **live EKS cluster passes**: the same linux/amd64 image run as a Job on a `c5.2xlarge` node (no GPU, 2 CPU requested / 3 limit, 1 Gi `/dev/shm`) minted the token in 13.0 s for one domain, and then did `domains/sample-200.txt` in **49.7 s**: 200 of 200 completed, 1 captcha, 199 via the API, 21 transient `InvalidCaptcha`/partial rows retried, no IP burned (runs 38276258324 and 38276782365 in `domain-metrics-management-service`). So the GitHub-runner failure was that runner, not x86 or VMs in general. Both Actions workflows cap rotations at 3 (`AHREF_MAX_ROTATIONS`).
-* **Running it from the management-service repo.** This repository has no cluster credential, so the test and the rollout run from `domain-metrics-management-service` → Actions → **ahref-local k8s test** (inputs: `ref`, `domain` or `domains_file`, `rotations`, `deploy`). It checks this repo out, builds and pushes the amd64 image, runs one Job and, with `deploy=true`, applies `k8s/ahref-local.yaml`. The queue-batch Deployment `ahref-local` has been live in `domain-metrics` since 2026-10-12 (one replica); `deploy-kube.yaml` here still works once this repo gets the same four secrets.
+* The GitHub Actions runner workflows were removed on 2026-10-12 (they fail Turnstile); the Workflow Runner page scales this Deployment instead.
+* **Result 2026-10-12, x86 hosts.** A GitHub `ubuntu-latest` runner (`ahref-batch.yml`, Chromium 155 x86_64, one domain) failed 10 of 10 captcha attempts across 5 proxy sessions and burned 10 IPs: its clicks landed 40 s after the widget instead of 6 s, so that runner is CPU-starved. The **live EKS cluster passes**: the same linux/amd64 image run as a Job on a `c5.2xlarge` node (no GPU, 2 CPU requested / 3 limit, 1 Gi `/dev/shm`) minted the token in 13.0 s for one domain, and then did `domains/sample-200.txt` in **49.7 s**: 200 of 200 completed, 1 captcha, 199 via the API, 21 transient `InvalidCaptcha`/partial rows retried, no IP burned (runs 38276258324 and 38276782365 in `domain-metrics-management-service`). So the GitHub-runner failure was that runner, not x86 or VMs in general. The Deployment caps rotations at 3 (`AHREF_MAX_ROTATIONS`).
+* **Running it from the management-service repo.** This repository has no cluster credential, so the test and the rollout run from `domain-metrics-management-service` → Actions → **ahref-local k8s test** (inputs: `ref`, `domain` or `domains_file`, `rotations`, `deploy`). It checks this repo out, builds and pushes the amd64 image, runs one Job and, with `deploy=true`, applies `k8s/ahref-local.yaml`. The queue-batch Deployment `ahref-local` has been live in `domain-metrics` since 2026-10-12 (one replica); `deploy-kube.yaml` here has its secrets since 2026-10-12 and rolls the Deployment on every push to `main`.
 
 ### Is a container detectable? (`tools/probe_fingerprint.py`)
 
