@@ -27,6 +27,10 @@ env:
   # Worker size, set per run by the Workflow Runner page. Default 1: the
   # cf-autoclick extension drives one browser window at a time.
   AHREF_WORKERS: ${{ github.event.inputs.workers || '1' }}
+  # Authority-only runs use the batch pull (GET /ahref-authority/batch): batch
+  # size, concurrency and the proxy come from the management service; the
+  # webshare proxy below is only the fallback when the server sends none.
+  AHREF_EXTRA_ARGS: ${{ github.event.inputs.modes == 'authority' && '--queue-batch' || '' }}
 
 jobs:
   run:
@@ -38,7 +42,8 @@ jobs:
         run: |
           echo "Cloning ahref-local repository..."
           rm -rf "$AHREF_DIR"
-          git clone --depth 1 https://github.com/ai-botxbyte/ahref-local.git "$AHREF_DIR"
+          # Clone THIS repository (ai-botxbyte/ahref-local is archived, read-only).
+          git clone --depth 1 "https://github.com/${{ github.repository }}.git" "$AHREF_DIR"
           echo "✅ ahref-local cloned to $AHREF_DIR"
           ls -la "$AHREF_DIR"
 
@@ -218,7 +223,7 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --no-cache-dir -r requirements.txt
-          nohup python3 ahrefs_checker.py --workers "${AHREF_WORKERS}" --webshare-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
+          nohup python3 ahrefs_checker.py --workers "${AHREF_WORKERS}" --webshare-proxy --modes "${AHREF_MODES}" ${AHREF_EXTRA_ARGS} > /tmp/ahref-checker.log 2>&1 &
           CHECKER_PID=$!
           echo "  Checker PID: $CHECKER_PID (modes: ${AHREF_MODES})"
           sleep 5
@@ -276,7 +281,7 @@ jobs:
               export NO_AT_BRIDGE=1
               cd "$AHREF_DIR"
               source .venv/bin/activate
-              nohup python3 ahrefs_checker.py --workers "${AHREF_WORKERS}" --webshare-proxy --modes "${AHREF_MODES}" > /tmp/ahref-checker.log 2>&1 &
+              nohup python3 ahrefs_checker.py --workers "${AHREF_WORKERS}" --webshare-proxy --modes "${AHREF_MODES}" ${AHREF_EXTRA_ARGS} > /tmp/ahref-checker.log 2>&1 &
               sleep 3
             fi
 
